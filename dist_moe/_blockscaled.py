@@ -1857,6 +1857,9 @@ class _BlockScaledAutograd(torch.autograd.Function):
                     # Training also emits the column-quantized WGRAD operand;
                     # inference returns only the combined output tensor.
                     h3_MD = combine_result[0] if save_col_quant else combine_result
+                # The postprocess takes route-wise rows, [num_tokens * topk, D], as
+                # on the BF16 path.
+                h3_MD = h3_MD.view(-1, hidden_dim)[: num_tokens * topk]
 
         w13_handle_tensors = None
         w2_handle_tensors = None
@@ -2263,6 +2266,8 @@ class _BlockScaledAutograd(torch.autograd.Function):
                     h3_saved = (
                         recomputed_combine[0] if save_col_quant else recomputed_combine
                     )
+                # Match the route-wise [num_tokens * topk, D] rows of the forward.
+                h3_saved = h3_saved.view(-1, hidden_dim)[: num_tokens * topk]
 
             if not postprocess.fuses_saved_copy_into_reduction:
                 conditional_copy_activations(

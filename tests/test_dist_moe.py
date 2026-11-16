@@ -3320,77 +3320,114 @@ class DistMoeKernelTest(unittest.TestCase):
             )
         self._assert_planner_reset(context.activation_buffer)
 
-    def test_bf16_callback_accumulates_closed_parameter_grad(self) -> None:
-        """Match callback padding sanitation and its closed parameter gradient."""
-        context, case_a, _, w13_EFD, w2_EDF = self._create_case(inference=False)
-        x_TD, topk_expert_ids_TK, topk_scores_TK = case_a
-        topk_expert_ids_TK = topk_expert_ids_TK.clone()
-        topk_expert_ids_TK[0] = -1
-        topk_scores_TK = topk_scores_TK.clone()
-        topk_scores_TK[0] = 0
-        actual_inputs = tuple(
-            tensor.detach().clone().requires_grad_()
-            for tensor in (x_TD, topk_scores_TK, w13_EFD, w2_EDF)
-        )
-        reference_inputs = tuple(
-            tensor.detach().clone().requires_grad_() for tensor in actual_inputs
-        )
-        scale_D = torch.randn(
-            x_TD.shape[-1],
-            dtype=x_TD.dtype,
-            device=x_TD.device,
-            requires_grad=True,
-        )
-        reference_scale_D = scale_D.detach().clone().requires_grad_()
+    def test_callback_accumulates_closed_parameter_grad(self) -> None:
+        """Match callback padding sanitation and its closed parameter gradient.
 
-        def callback(h3_MD: torch.Tensor) -> torch.Tensor:
-            """Require Dist-MoE to zero invalid callback-input rows."""
-            h3_TKD = h3_MD.view(*topk_expert_ids_TK.shape, -1)
-            self.assertEqual(
-                torch.count_nonzero(h3_TKD[topk_expert_ids_TK < 0]).item(),
-                0,
-            )
-            return h3_MD * scale_D
-
-        actual_TD = dist_moe.routed_experts(
-            actual_inputs[0],
-            topk_expert_ids_TK,
-            actual_inputs[1],
-            actual_inputs[2],
-            actual_inputs[3],
-            context,
-            options=dist_moe.ExecutionOptions(
-                experts_output_postprocess=callback,
-                zero_out_padded_callback_inputs=True,
-            ),
-        )
-        expected_TD = _reference_moe(
-            reference_inputs[0],
-            topk_expert_ids_TK,
-            reference_inputs[1],
-            reference_inputs[2],
-            reference_inputs[3],
-            experts_output_postprocess=lambda h3_RD: h3_RD * reference_scale_D,
-        )
-        grad_output_TD = torch.randn_like(actual_TD)
-        actual_TD.backward(grad_output_TD)
-        expected_TD.backward(grad_output_TD)
-
-        torch.testing.assert_close(actual_TD, expected_TD, rtol=2e-2, atol=2e-2)
-        for name, actual, expected in zip(
-            ("x", "topk_scores", "w13", "w2", "callback_scale"),
-            (*actual_inputs, scale_D),
-            (*reference_inputs, reference_scale_D),
-            strict=True,
+        BF16 and MXFP8 must both pass zeroed route-wise ``[T * K, D]`` rows to
+        the callback. BF16 uses elementwise bounds; MXFP8 uses calibrated
+        relative-L2 and cosine bounds, with 32 tokens so the score gradient has
+        enough elements for a stable cosine.
+        """
+        for block_scaled, num_tokens in (
+            (None, 8),
+            (dist_moe.BlockScaledConfig(), 32),
         ):
-            torch.testing.assert_close(
-                actual.grad,
-                expected.grad,
-                rtol=3e-2,
-                atol=3e-2,
-                msg=lambda message, name=name: f"{name}: {message}",
-            )
-        self._assert_planner_reset(context.activation_buffer)
+            with self.subTest(block_scaled=block_scaled is not None):
+                context, case_a, _, w13_EFD, w2_EDF = self._create_case(
+                    num_tokens=num_tokens,
+                    inference=False,
+                    block_scaled=block_scaled,
+                )
+                x_TD, topk_expert_ids_TK, topk_scores_TK = case_a
+                topk_expert_ids_TK = topk_expert_ids_TK.clone()
+                topk_expert_ids_TK[0] = -1
+                topk_scores_TK = topk_scores_TK.clone()
+                topk_scores_TK[0] = 0
+                actual_inputs = tuple(
+                    tensor.detach().clone().requires_grad_()
+                    for tensor in (x_TD, topk_scores_TK, w13_EFD, w2_EDF)
+                )
+                reference_inputs = tuple(
+                    tensor.detach().clone().requires_grad_() for tensor in actual_inputs
+                )
+                scale_D = torch.randn(
+                    x_TD.shape[-1],
+                    dtype=x_TD.dtype,
+                    device=x_TD.device,
+                    requires_grad=True,
+                )
+                reference_scale_D = scale_D.detach().clone().requires_grad_()
+
+                def callback(
+                    h3_MD: torch.Tensor,
+                    topk_expert_ids_TK: torch.Tensor = topk_expert_ids_TK,
+                    scale_D: torch.Tensor = scale_D,
+                ) -> torch.Tensor:
+                    """Require Dist-MoE to zero invalid callback-input rows."""
+                    h3_TKD = h3_MD.view(*topk_expert_ids_TK.shape, -1)
+                    self.assertEqual(
+                        torch.count_nonzero(h3_TKD[topk_expert_ids_TK < 0]).item(),
+                        0,
+                    )
+                    return h3_MD * scale_D
+
+                actual_TD = dist_moe.routed_experts(
+                    actual_inputs[0],
+                    topk_expert_ids_TK,
+                    actual_inputs[1],
+                    actual_inputs[2],
+                    actual_inputs[3],
+                    context,
+                    options=dist_moe.ExecutionOptions(
+                        experts_output_postprocess=callback,
+                        zero_out_padded_callback_inputs=True,
+                    ),
+                )
+                expected_TD = _reference_moe(
+                    reference_inputs[0],
+                    topk_expert_ids_TK,
+                    reference_inputs[1],
+                    reference_inputs[2],
+                    reference_inputs[3],
+                    experts_output_postprocess=(
+                        lambda h3_RD, scale_D=reference_scale_D: h3_RD * scale_D
+                    ),
+                )
+                grad_output_TD = torch.randn_like(actual_TD)
+                actual_TD.backward(grad_output_TD)
+                expected_TD.backward(grad_output_TD)
+
+                pairs = [("output", "fwd", actual_TD, expected_TD)]
+                for name, actual, expected in zip(
+                    ("x", "topk_scores", "w13", "w2", "callback_scale"),
+                    (*actual_inputs, scale_D),
+                    (*reference_inputs, reference_scale_D),
+                    strict=True,
+                ):
+                    direction = "grad" if name in ("x", "topk_scores") else "wgrad"
+                    pairs.append((name, direction, actual.grad, expected.grad))
+                for name, direction, actual, expected in pairs:
+                    if block_scaled is None:
+                        tolerance = 2e-2 if name == "output" else 3e-2
+                        torch.testing.assert_close(
+                            actual,
+                            expected,
+                            rtol=tolerance,
+                            atol=tolerance,
+                            msg=lambda message, name=name: f"{name}: {message}",
+                        )
+                    else:
+                        _rtol, _atol, relative_l2, cosine = _blockscaled_tolerance(
+                            block_scaled.format,
+                            direction,
+                        )
+                        self.assertLess(
+                            _relative_l2(actual, expected), relative_l2, msg=name
+                        )
+                        self.assertGreater(
+                            _cosine_similarity(actual, expected), cosine, msg=name
+                        )
+                self._assert_planner_reset(context.activation_buffer)
 
     def test_bf16_modes_are_visible_to_non_strict_tracing(self) -> None:
         """Trace BF16 training and inference through their registered ops."""
