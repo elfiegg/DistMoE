@@ -347,6 +347,29 @@ the standalone activation uses the inverse device predicate to cover the
 saved-`h1` path. Backward skips clip counting. The launches and planned
 activation addresses stay fixed across graph replay.
 
+#### Pinned H3 replay
+
+The opt-in `Config.bf16_h3_offload_layers` tuple selects ordered, zero-based
+layers in one BF16 training slot. Every selected layer must be recomputed by
+the device planner, and the final layer must use the normal backward so it
+can release combine before the first restore. This policy requires real EP
+buffers, fixed local token counts, and a native SwiGLU epilogue. VMM, clip
+counters, compiler tracing, and overlapping schedules are unsupported.
+
+The context allocates one pinned snapshot per selected layer. Each has
+`max_num_local_input_tokens * top_k * hidden_dim * 2` bytes. Two device stages
+borrow the low end of shared scratch only after proving that they fit below
+the maximum forward working set. The first backward waits for both stage
+reads before it can reuse that memory. The final EP barrier of each backward
+orders the next layer's host restore into local combine, where the backward
+postprocess consumes it without replaying W2.
+
+Run a full eager forward/backward before graph capture. The first selected
+layer's probe compares its saved and replayed BF16 words on valid routes.
+Capture the entire forward and reverse-order backward in a single CUDA graph.
+This opt-in path needs CUDA correctness and throughput verification on its
+target workload.
+
 ### 2. Router-score gradient and route output gradient
 
 Without postprocessing, `broadcast_and_scale()` combines `grad_output`,

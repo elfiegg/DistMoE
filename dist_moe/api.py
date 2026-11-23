@@ -83,6 +83,7 @@ if TYPE_CHECKING:
         ActivationBuffer,
         ModelConfig,
     )
+    from ._bf16_h3 import _BF16H3Offload
 
 
 __all__ = [
@@ -404,6 +405,12 @@ class Config:
             inference routing, layouts, formats, and scratch-only planning.
             Per-call `torch.no_grad()` evaluation on a training context is
             supported independently and does not consume activation slots.
+        bf16_h3_offload_layers: Optional strictly increasing zero-based layer
+            indices whose recomputed down projections may use pinned host
+            snapshots. Requires one BF16 training slot, a full fixed-shape
+            forward followed by reverse-order backward, and eager warmup
+            before capturing both together in one CUDA graph. The final layer
+            must use its normal backward path to release combine for restores.
     """
 
     max_num_local_input_tokens: int
@@ -427,6 +434,7 @@ class Config:
     inference: bool = False
     situ_glu_gate_beta: float = SITU_GLU_GATE_BETA_DEFAULT
     situ_glu_up_beta: float = SITU_GLU_UP_BETA_DEFAULT
+    bf16_h3_offload_layers: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:  # noqa: C901
         """Validate static execution parameters.
@@ -551,6 +559,29 @@ class Config:
             raise ValueError("block-scaled SiTU-GLU supports MXFP8 E4M3 only")
         if self.block_scaled is not None:
             _validate_block_scaled_config(self)
+        if self.bf16_h3_offload_layers:
+            layers = self.bf16_h3_offload_layers
+            if (
+                self.inference
+                or self.block_scaled is not None
+                or self.vmm is not None
+                or self.num_activation_slots != 1
+                or self.activation not in ("swiglu", "swiglu_clamped")
+            ):
+                raise ValueError(
+                    "BF16 H3 offload requires one device-only BF16 SwiGLU training slot"
+                )
+            if (
+                any(
+                    type(layer) is not int
+                    or not 0 <= layer < self.max_moe_layers_per_activation_slot - 1
+                    for layer in layers
+                )
+                or tuple(sorted(set(layers))) != layers
+            ):
+                raise ValueError(
+                    "BF16 H3 offload layers must be ordered, unique, and exclude the final layer"
+                )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1253,6 +1284,7 @@ class Context:
         _vmm_pool: Private PyTorch memory pool owning a VMM allocation.
         _closed: Whether this context has been closed.
         _vmm_teardown_device: Device whose failed VMM teardown remains retryable.
+        _bf16_h3_offload: Optional owner of BF16 host snapshots and copy streams.
     """
 
     group: dist.ProcessGroup
@@ -1264,6 +1296,7 @@ class Context:
     _vmm_pool: Any | None = None
     _closed: bool = False
     _vmm_teardown_device: int | None = None
+    _bf16_h3_offload: _BF16H3Offload | None = None
 
     def __init__(self) -> None:
         """Reject construction outside :func:`create_context`.
@@ -1348,6 +1381,8 @@ class Context:
         """
         if self._closed:
             raise RuntimeError("distributed MoE context is closed")
+        if self._bf16_h3_offload is not None:
+            self._bf16_h3_offload.require_drained()
         if self.activation_buffer is not None:
             self.activation_buffer.reset()
 
@@ -1377,6 +1412,13 @@ class Context:
         """
         if self._closed:
             raise RuntimeError("distributed MoE context is closed")
+        if self._bf16_h3_offload is not None and (
+            activation_slot != 0
+            or num_moe_layers_in_slot != self.config.max_moe_layers_per_activation_slot
+        ):
+            raise ValueError(
+                "BF16 H3 offload requires the complete depth of its single slot"
+            )
         if self.activation_buffer is not None:
             self.activation_buffer.select_activation_slot(
                 activation_slot,
@@ -1396,9 +1438,14 @@ class Context:
             self._closed
             and self._vmm_pool is None
             and self._vmm_teardown_device is None
+            and self._bf16_h3_offload is None
         ):
             return
         self._closed = True
+        if self._bf16_h3_offload is not None:
+            assert self.activation_buffer is not None
+            torch.cuda.synchronize(self.activation_buffer.buffer.device)
+            self._bf16_h3_offload = None
         if self._vmm_pool is not None:
             assert self.activation_buffer is not None
             device = self.activation_buffer.buffer.device
@@ -1633,6 +1680,34 @@ def create_context(  # noqa: C901
     plan = plan_memory(config, world_size, device=device)
     if emulate_peer_buffers is None:
         emulate_peer_buffers = is_fake_process_group(group)
+    h3_stage_offsets = None
+    if config.bf16_h3_offload_layers:
+        if emulate_peer_buffers or is_fake_process_group(group):
+            raise ValueError("BF16 H3 offload requires real expert-parallel buffers")
+        from ._bf16_h3 import _BF16H3Offload, _h3_stage_offsets
+        from .kernels.dist_grouped_gemm import _native_swiglu_fwd_config_is_compatible
+
+        preset = _bf16_compute_config(
+            config,
+            routed_rows=config.max_num_local_input_tokens * config.top_k,
+            num_groups=config.num_experts // world_size,
+        )
+        if preset is None or not _native_swiglu_fwd_config_is_compatible(
+            preset, config.intermediate_dim
+        ):
+            raise ValueError("BF16 H3 offload requires the native SwiGLU epilogue")
+
+        route_bytes = (
+            config.max_num_local_input_tokens * config.top_k * config.hidden_dim * 2
+        )
+        h3_stage_offsets = _h3_stage_offsets(
+            scratch_base=plan.total_activation_bytes,
+            scratch_bytes=plan.device_scratch_bytes,
+            max_receive_rows=plan.total_scratch_capacity_rows,
+            hidden_dim=config.hidden_dim,
+            intermediate_dim=config.intermediate_dim,
+            route_bytes=route_bytes,
+        )
     logger.info("%s", plan.explain())
     assert emulate_peer_buffers is not None
     uses_vmm = plan.uses_host_scratch
@@ -1730,6 +1805,17 @@ def create_context(  # noqa: C901
         )
         activation_buffer.peak_min_free_space.fill_(free_bytes)
         activation_buffer.initial_peak_min_free_space.fill_(free_bytes)
+    h3_offload = (
+        _BF16H3Offload(
+            activation_buffer.buffer,
+            h3_stage_offsets,
+            route_bytes=route_bytes,
+            layers=config.max_moe_layers_per_activation_slot,
+            selected_layers=config.bf16_h3_offload_layers,
+        )
+        if h3_stage_offsets is not None
+        else None
+    )
     with _CONTEXT_LOCK:
         context_id = str(next(_CONTEXT_IDS))
         context = Context._create(
@@ -1741,6 +1827,7 @@ def create_context(  # noqa: C901
             context_id=context_id,
             vmm_pool=vmm_pool,
         )
+        context._bf16_h3_offload = h3_offload
         _register_context(context_id, context)
     return context
 
@@ -2029,6 +2116,23 @@ class _Bf16Autograd(torch.autograd.Function):
             x_TD.shape,
             x_TD.dtype,
         )
+        h3_offload = context._bf16_h3_offload
+        if h3_offload is not None:
+            if num_local_input_tokens != config.max_num_local_input_tokens:
+                raise ValueError("BF16 H3 offload requires a fixed input token count")
+            if save_for_backward:
+                if num_moe_layers_in_slot != config.max_moe_layers_per_activation_slot:
+                    raise ValueError(
+                        "BF16 H3 offload requires one complete forward slot"
+                    )
+                if options.swiglu_clip_stats_out_3 is not None:
+                    raise ValueError(
+                        "BF16 H3 offload is incompatible with SwiGLU clip counters"
+                    )
+                h3_offload.before_forward()
+            else:
+                h3_offload.require_drained()
+                h3_offload = None
 
         # 2. Publish routing and activation payloads before deriving peer
         # pointers. Every rank observes both payloads after the same barrier.
@@ -2112,6 +2216,14 @@ class _Bf16Autograd(torch.autograd.Function):
             and fprop_config is not None
             and _native_swiglu_fwd_config_is_compatible(fprop_config, w2_EDF.shape[2])
         )
+        if h3_offload is not None:
+            if not fused_swiglu_forward:
+                raise ValueError("BF16 H3 offload requires the native SwiGLU epilogue")
+            if h3_offload.saves_next_forward():
+                torch._assert_async(
+                    forward_plan.need_recompute,
+                    "A selected BF16 H3 offload layer was retained on device",
+                )
 
         # 3. Retain the local input only when backward may need device-selected
         # recomputation; all other intermediates follow the planner offsets.
@@ -2207,6 +2319,10 @@ class _Bf16Autograd(torch.autograd.Function):
 
         # 6. Retain only graph-stable routing, planner, policy, and activation
         # state needed to reconstruct the matching backward.
+        if h3_offload is not None:
+            ctx.h3_offload_frame = h3_offload.after_forward(
+                forward_plan.need_recompute, h3_MD
+            )
         assert num_recv_rows_per_rank_R is not None
         ctx.context_id = context_id
         ctx.num_local_input_tokens = num_local_input_tokens
@@ -2367,6 +2483,9 @@ class _Bf16Autograd(torch.autograd.Function):
         # 2. Rebuild typed plan views from saved scalar offsets, then let the
         # device planner choose saved versus recomputed intermediates without
         # changing the captured launch topology.
+        h3_offload = context._bf16_h3_offload
+        if h3_offload is not None:
+            h3_offload.before_backward(ctx.h3_offload_frame, need_recompute)
         forward_plan = ForwardPlan(
             need_recompute=need_recompute,
             x_offset=x_offset,
@@ -2463,35 +2582,48 @@ class _Bf16Autograd(torch.autograd.Function):
                 feature_dim=w2_EDF.shape[2],
                 dtype=w2_EDF.dtype,
             )
-            h3_saved_MD = dist_grouped_gemm_fprop_combine(
-                x=backward_plan.h2_offset,
-                w=w2_EDF,
-                num_tokens_per_local_expert=num_recv_rows_per_local_expert_E,
-                scatter_ptrs=combine_scatter_ptrs_M,
-                symm_mem_buffer=buffers.combine,
-                num_sms=config.num_sms,
-                activation_buffer=activation_buffer.buffer,
-                conditional_execution=need_recompute,
-                config=combine_config,
-                estimate_recv_num_tokens=estimated_num_recv_rows,
+            h3_frame = ctx.h3_offload_frame if h3_offload is not None else None
+            probe_h3 = (
+                h3_frame is not None
+                and h3_offload is not None
+                and h3_offload.probes(h3_frame)
             )
-            h3_saved_MD = h3_saved_MD.view(-1, context.hidden_dim)[
-                : num_local_input_tokens * context.top_k
-            ]
-            if (
-                not input_scaled_rmsnorm
-                and not ctx.postprocess.fuses_saved_copy_into_reduction
-            ):
-                conditional_copy_activations(
-                    condition=need_recompute,
-                    lhs=None,
-                    lhs_offset=None,
-                    rhs=h3_saved_MD,
-                    rhs_offset=h3_offset,
+            if h3_frame is not None and h3_frame.snapshot is not None and not probe_h3:
+                assert h3_offload is not None
+                h3_saved_MD = h3_offload.restore(h3_frame)
+            else:
+                h3_saved_MD = dist_grouped_gemm_fprop_combine(
+                    x=backward_plan.h2_offset,
+                    w=w2_EDF,
+                    num_tokens_per_local_expert=num_recv_rows_per_local_expert_E,
+                    scatter_ptrs=combine_scatter_ptrs_M,
+                    symm_mem_buffer=buffers.combine,
+                    num_sms=config.num_sms,
                     activation_buffer=activation_buffer.buffer,
-                    copy_to_buffer=False,
+                    conditional_execution=need_recompute,
+                    config=combine_config,
+                    estimate_recv_num_tokens=estimated_num_recv_rows,
                 )
-            _ep_barrier(buffers.combine, conditional_execution=need_recompute)
+                h3_saved_MD = h3_saved_MD.view(-1, context.hidden_dim)[
+                    : num_local_input_tokens * context.top_k
+                ]
+                if (
+                    not input_scaled_rmsnorm
+                    and not ctx.postprocess.fuses_saved_copy_into_reduction
+                ):
+                    conditional_copy_activations(
+                        condition=need_recompute,
+                        lhs=None,
+                        lhs_offset=None,
+                        rhs=h3_saved_MD,
+                        rhs_offset=h3_offset,
+                        activation_buffer=activation_buffer.buffer,
+                        copy_to_buffer=False,
+                    )
+                _ep_barrier(buffers.combine, conditional_execution=need_recompute)
+                if probe_h3:
+                    assert h3_offload is not None and h3_frame is not None
+                    h3_offload.check_replay(h3_frame, h3_saved_MD, topk_expert_ids_TK)
 
         # 4. Reverse postprocessing before expert DGRAD/WGRAD so both paths
         # consume the same route-wise gradient representation.
@@ -2684,6 +2816,8 @@ class _Bf16Autograd(torch.autograd.Function):
         # `[T, D]`, and restore logical weight shapes unless an external WGRAD
         # owner consumed those gradients directly.
         _ep_barrier(buffers.dispatch)
+        if h3_offload is not None:
+            h3_offload.after_backward_barrier(ctx.h3_offload_frame)
         grad_x_TD = reduce_from_topk(
             grad_x_TKD,
             expert_ids=topk_expert_ids_TK,
@@ -4130,7 +4264,10 @@ def routed_experts(  # noqa: C901
     activation_buffer = context.activation_buffer
     assert activation_buffer is not None
     tracing = torch.compiler.is_compiling() or _get_current_dispatch_mode() is not None
-    if save_for_backward and not options.requires_eager:
+    h3_offload = save_for_backward and context._bf16_h3_offload is not None
+    if h3_offload and tracing:
+        raise RuntimeError("BF16 H3 offload requires eager execution or a CUDA graph")
+    if save_for_backward and not (options.requires_eager or h3_offload):
         assert logical_w13_weight is not None and logical_w2_weight is not None
         return _RegisteredBf16Autograd.apply(
             x_TD,
@@ -4146,7 +4283,7 @@ def routed_experts(  # noqa: C901
             options.swiglu_clip_limit,
             options,
         )
-    if options.requires_eager:
+    if options.requires_eager or h3_offload:
         if tracing:
             raise RuntimeError(
                 "DistMoE Python weight, expert-output, and WGRAD callbacks "

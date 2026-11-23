@@ -355,6 +355,61 @@ def _blockscaled_tolerance(
 class DistMoeConfigTest(unittest.TestCase):
     """CPU validation tests for the public configuration surface."""
 
+    def test_bf16_h3_offload_restricts_slot_schedule(self) -> None:
+        """Selected host layers require an ordered single training slot."""
+        config = dist_moe.Config(
+            max_num_local_input_tokens=32,
+            hidden_dim=128,
+            intermediate_dim=128,
+            top_k=2,
+            num_experts=8,
+            max_moe_layers_per_activation_slot=4,
+            bf16_h3_offload_layers=(0, 2),
+        )
+        for change in (
+            {"bf16_h3_offload_layers": (2, 0)},
+            {"bf16_h3_offload_layers": (0, 0)},
+            {"bf16_h3_offload_layers": (3,)},
+            {"num_activation_slots": 2},
+            {"activation": "situ_glu"},
+            {"inference": True},
+        ):
+            with (
+                self.subTest(change=change),
+                self.assertRaisesRegex(ValueError, "BF16 H3 offload"),
+            ):
+                dataclasses.replace(config, **change)
+
+    def test_bf16_h3_banks_fit_below_forward_scratch(self) -> None:
+        """At peak routing, two banks fit exactly or reject undersized scratch."""
+        from dist_moe._bf16_h3 import _h3_stage_offsets
+
+        config = dist_moe.Config(
+            max_num_local_input_tokens=32,
+            hidden_dim=128,
+            intermediate_dim=128,
+            top_k=2,
+            num_experts=8,
+            max_moe_layers_per_activation_slot=4,
+            bf16_h3_offload_layers=(0, 2),
+        )
+        plan = dist_moe.plan_memory(config, ep_size=2)
+        arguments = dict(
+            scratch_base=plan.total_activation_bytes,
+            scratch_bytes=plan.device_scratch_bytes,
+            max_receive_rows=plan.total_scratch_capacity_rows,
+            hidden_dim=config.hidden_dim,
+            intermediate_dim=config.intermediate_dim,
+            route_bytes=16_384,
+        )
+        self.assertEqual(
+            _h3_stage_offsets(**arguments),
+            (plan.total_activation_bytes, plan.total_activation_bytes + 16_384),
+        )
+        arguments["scratch_bytes"] -= 128
+        with self.assertRaisesRegex(ValueError, "two staging banks"):
+            _h3_stage_offsets(**arguments)
+
     def test_situ_glu_defaults_match_public_fields(self) -> None:
         """Gate and up defaults match the public SiTU-GLU configuration fields."""
         self.assertEqual(SITU_GLU_GATE_BETA_DEFAULT, 4.0)
