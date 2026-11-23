@@ -111,7 +111,9 @@ class ExecutionOptions:
         experts_output_postprocess: Optional deterministic callable applied to
             each route-wise expert output before score weighting and top-k
             reduction, or ``RMSNormPostprocess`` for fused RMSNorm plus top-k
-            reduction. A callable must preserve shape,
+            reduction. ``InputScaledRMSNormPostprocess`` opts into the native
+            BF16 learned input-scale path when its training contract is met.
+            A callable must preserve shape,
             device, contiguity, and dtype across forward and backward replay.
             Closure parameters accumulate gradients through nested backward
             and are not explicit inputs to the outer custom autograd function.

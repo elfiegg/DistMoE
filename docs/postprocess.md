@@ -19,14 +19,27 @@ output row per input token.
 <a id="choose-a-policy"></a>
 ## Choose a policy
 
-`dist_moe.ExecutionOptions.experts_output_postprocess` selects one of three
-behaviors:
+`dist_moe.ExecutionOptions.experts_output_postprocess` selects the combine policy:
 
 | Value | Forward behavior | Backward behavior | Graph support |
 | --- | --- | --- | --- |
 | `None` | Multiply route rows by router scores and reduce top-k. | Differentiate score weighting and reduction. | Registered op, FakeTensor, non-strict `make_fx`, activation checkpointing, CUDA graphs. |
 | Callable | Apply the callback to each route row, then perform ordinary score weighting and reduction. | Recompute the callback under autograd and differentiate it with the reduction. | Eager only. |
 | `dist_moe.RMSNormPostprocess` | Fuse RMSNorm, router-score weighting, and top-k reduction. | Use the fused RMSNorm/reduction backward. | Callback-free policies use the registered graph boundary; observers select eager execution. |
+| `dist_moe.InputScaledRMSNormPostprocess` | Fuse learned input-scale RMSNorm with score weighting at the supported BF16 training shape. | Recompute RMS statistics and publish route gradients directly from the saved or replayed W2 output. | Eager orchestration and CUDA graph capture. |
+
+The input-scale policy is opt-in. It requires BF16 activations and gain, FP32
+route scores, and the fixed clamped-SwiGLU training shape documented in the
+public class. Its backward reuses the planner's unpublished grad-H2 workspace
+for gain-gradient partials and sends the result to the parameter through the
+caller's weight getter. Unsupported geometry and forward-only execution use
+the supplied callback. Continue to set
+`ExecutionOptions.zero_out_padded_callback_inputs=True` when that callback
+can receive padded routes.
+
+The fused policy adds the gain center in FP32 and rounds each normalized route
+to BF16 before applying the FP32 router scores. Compare results to the fallback
+with a tolerance because the parallel reduction order can differ.
 
 Routing scores and top-k expert IDs are inputs to Dist-MoE. Routing itself is
 not part of postprocessing and is not computed by these kernels.

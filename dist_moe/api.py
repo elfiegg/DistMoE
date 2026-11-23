@@ -54,6 +54,11 @@ from ._execution import (
     ExecutionOptions,
     PreparedWeight,
 )
+from ._input_scaled_rmsnorm import (
+    _ResolvedInputScaledRMSNorm,
+    _resolve_input_scaled_rmsnorm,
+    InputScaledRMSNormPostprocess,
+)
 from ._postprocess import (
     _registered_rmsnorm_args,
     _resolve_experts_output_postprocess_fn,
@@ -88,6 +93,7 @@ __all__ = [
     "Config",
     "Context",
     "ExecutionOptions",
+    "InputScaledRMSNormPostprocess",
     "MemoryPlan",
     "PreparedWeight",
     "VmmConfig",
@@ -1982,8 +1988,25 @@ class _Bf16Autograd(torch.autograd.Function):
         config = context.config
         scratch_only = config.inference or not save_for_backward
         buffers = context.buffers
-        postprocess = _resolve_experts_output_postprocess_fn(
-            options.experts_output_postprocess,
+        configured_postprocess = options.experts_output_postprocess
+        input_scaled_rmsnorm = None
+        if (
+            isinstance(configured_postprocess, InputScaledRMSNormPostprocess)
+            and not scratch_only
+            and config.activation == "swiglu_clamped"
+            and not is_fake_process_group(context.group)
+        ):
+            input_scaled_rmsnorm = _resolve_input_scaled_rmsnorm(
+                configured_postprocess,
+                x_TD=x_TD,
+                topk_expert_ids_TK=topk_expert_ids_TK,
+                topk_scores_TK=topk_scores_TK,
+                intermediate_dim=config.intermediate_dim,
+                num_experts=config.num_experts,
+                ep_size=dist.get_world_size(context.group),
+            )
+        postprocess = input_scaled_rmsnorm or _resolve_experts_output_postprocess_fn(
+            configured_postprocess,
             x_TD=x_TD,
             topk_expert_ids_TK=topk_expert_ids_TK,
             topk_scores_TK=topk_scores_TK,
@@ -2381,6 +2404,7 @@ class _Bf16Autograd(torch.autograd.Function):
             "swiglu",
             "swiglu_clamped",
         ) and _native_swiglu_fwd_config_is_compatible(fprop_config, w2_EDF.shape[2])
+        input_scaled_rmsnorm = isinstance(ctx.postprocess, _ResolvedInputScaledRMSNorm)
 
         # 3. Recompute H1/H3 only when needed. H2 is always transient scratch,
         # so it must also be rebuilt when H1 was saved.
@@ -2454,7 +2478,10 @@ class _Bf16Autograd(torch.autograd.Function):
             h3_saved_MD = h3_saved_MD.view(-1, context.hidden_dim)[
                 : num_local_input_tokens * context.top_k
             ]
-            if not ctx.postprocess.fuses_saved_copy_into_reduction:
+            if (
+                not input_scaled_rmsnorm
+                and not ctx.postprocess.fuses_saved_copy_into_reduction
+            ):
                 conditional_copy_activations(
                     condition=need_recompute,
                     lhs=None,
@@ -2468,23 +2495,41 @@ class _Bf16Autograd(torch.autograd.Function):
 
         # 4. Reverse postprocessing before expert DGRAD/WGRAD so both paths
         # consume the same route-wise gradient representation.
-        grad_h3_MD, grad_topk_scores_TK, grad_h3_is_published = (
-            ctx.postprocess.backward(
-                grad_output_TD,
-                h3_saved_MD,
-                topk_scores_TK,
-                postprocess_output_dtype=ctx.postprocess_output_dtype,
-                context=postprocess_context,
-                publish_view=lambda shape, dtype: buffers.combine.hdl.get_buffer(
-                    buffers.combine.hdl.rank,
-                    shape,
-                    dtype,
-                ),
-                x_buffer=activation_buffer.buffer,
-                x_buffer_offset=h3_offset,
-                x_buffer_condition=need_recompute,
+        if input_scaled_rmsnorm:
+            published_MD = buffers.combine.hdl.get_buffer(
+                buffers.combine.hdl.rank, h3_saved_MD.shape, h3_saved_MD.dtype
             )
-        )
+            grad_h3_MD, grad_topk_scores_TK, grad_h3_is_published = (
+                ctx.postprocess.backward(
+                    grad_output_TD,
+                    h3_saved_MD,
+                    topk_scores_TK,
+                    published_MD,
+                    activation_buffer=activation_buffer.buffer,
+                    h3_offset_1=h3_offset,
+                    need_recompute_1=need_recompute,
+                    grad_h2_offset_1=backward_plan.grad_h2_offset,
+                    num_recv_rows_1=num_recv_rows_1,
+                )
+            )
+        else:
+            grad_h3_MD, grad_topk_scores_TK, grad_h3_is_published = (
+                ctx.postprocess.backward(
+                    grad_output_TD,
+                    h3_saved_MD,
+                    topk_scores_TK,
+                    postprocess_output_dtype=ctx.postprocess_output_dtype,
+                    context=postprocess_context,
+                    publish_view=lambda shape, dtype: buffers.combine.hdl.get_buffer(
+                        buffers.combine.hdl.rank,
+                        shape,
+                        dtype,
+                    ),
+                    x_buffer=activation_buffer.buffer,
+                    x_buffer_offset=h3_offset,
+                    x_buffer_condition=need_recompute,
+                )
+            )
         if not grad_h3_is_published:
             buffers.combine.hdl.get_buffer(
                 buffers.combine.hdl.rank,
