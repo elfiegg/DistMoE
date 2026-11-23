@@ -4848,8 +4848,9 @@ class DistMoeKernelTest(unittest.TestCase):
     def test_bf16_situ_glu_excludes_native_swiglu_fusion(self) -> None:
         """SiTU-GLU falls back while plain/clamped retain eligible native fusion.
 
-        Real launches prove both dispatch decisions; output and all gradients
-        match the PyTorch formula within the existing BF16 tolerances.
+        Real launches check forward and replay dispatch decisions and the
+        standalone replay predicate. Output and all gradients match the
+        PyTorch formula within the existing BF16 tolerances.
         """
         from dist_moe import _triton_ops as triton_ops_impl
 
@@ -4910,10 +4911,24 @@ class DistMoeKernelTest(unittest.TestCase):
                     grad_TD = torch.randn_like(actual_TD)
                     actual_TD.backward(grad_TD)
                     expected_TD.backward(grad_TD)
+                    replay_dispatch = dispatch.call_args.kwargs
+                    replay_activation = standalone_forward.call_args.kwargs
+                    self.assertIsNotNone(replay_dispatch["conditional_execution"])
                     if activation == "situ_glu":
+                        self.assertIsNone(replay_dispatch["swiglu_h2"])
+                        self.assertIsNone(replay_activation["conditional_execution"])
                         fused_backward.assert_not_called()
                         standalone_backward.assert_called_once()
                     else:
+                        self.assertIsNotNone(replay_dispatch["swiglu_h2"])
+                        self.assertTrue(
+                            torch.equal(
+                                replay_activation["conditional_execution"],
+                                torch.logical_not(
+                                    replay_dispatch["conditional_execution"]
+                                ),
+                            )
+                        )
                         fused_backward.assert_called_once()
                         standalone_backward.assert_not_called()
                 torch.testing.assert_close(actual_TD, expected_TD, rtol=2e-2, atol=2e-2)

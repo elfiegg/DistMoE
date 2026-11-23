@@ -2327,6 +2327,7 @@ class _Bf16Autograd(torch.autograd.Function):
             swiglu_fwd,
         )
         from dist_moe.kernels.dist_grouped_gemm import (
+            _native_swiglu_fwd_config_is_compatible,
             dist_grouped_gemm_dgrad_combine,
             dist_grouped_gemm_dgrad_dispatch,
             dist_grouped_gemm_dgrad_swiglu_bwd_combine,
@@ -2376,9 +2377,13 @@ class _Bf16Autograd(torch.autograd.Function):
             num_groups=w13_EFD.shape[0],
         )
         assert fprop_config is not None and wgrad_config is not None
+        fused_swiglu_recompute = config.activation in (
+            "swiglu",
+            "swiglu_clamped",
+        ) and _native_swiglu_fwd_config_is_compatible(fprop_config, w2_EDF.shape[2])
 
         # 3. Recompute H1/H3 only when needed. H2 is always transient scratch,
-        # so its activation kernel runs even when H1 was saved.
+        # so it must also be rebuilt when H1 was saved.
         _initialize_fake_peer_scatter_output(buffers.combine)
         with record_function("dist_moe_recompute"):
             dispatch_local_TD = buffers.dispatch.hdl.get_buffer(
@@ -2408,12 +2413,21 @@ class _Bf16Autograd(torch.autograd.Function):
                 conditional_execution=need_recompute,
                 config=fprop_config,
                 estimate_recv_num_tokens=estimated_num_recv_rows,
+                swiglu_h2=backward_plan.h2_offset if fused_swiglu_recompute else None,
+                swiglu_clamped=config.activation == "swiglu_clamped",
+                swiglu_alpha=config.swiglu_alpha,
+                swiglu_limit=config.swiglu_limit,
             )
-            # H2 is always transient scratch, even when H1 was saved. Rebuild
-            # it unconditionally before W2 WGRAD, matching the internal order.
+            # Match the dispatch's device predicate to rebuild H2 exactly
+            # once without changing the launch sequence on graph replay.
             swiglu_fwd(
                 x=backward_plan.h1_offset,
                 z=backward_plan.h2_offset,
+                conditional_execution=(
+                    torch.logical_not(need_recompute)
+                    if fused_swiglu_recompute
+                    else None
+                ),
                 clamped=config.activation == "swiglu_clamped",
                 alpha=config.swiglu_alpha,
                 limit=config.swiglu_limit,

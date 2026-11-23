@@ -319,7 +319,7 @@ weights.
 | Order | API or kernel | Reads | Writes | Residency and lifetime | Synchronization |
 | ---: | --- | --- | --- | --- | --- |
 | 1 | `get_backward_plan()` | saved forward offsets and planner state | saved-or-scratch offsets for this layer | device-only planner decision | launch ordered; no host read |
-| 2 | conditional FC13/W2 recompute plus standalone SwiGLU | saved `x` or `h1` and fixed scratch offsets | reconstructed intermediates and fresh scratch `h2` | fixed launches; GEMMs are device-predicated, SwiGLU always runs | conditional peer publication and barrier |
+| 2 | conditional FC13/W2 recompute and SwiGLU | saved `x` or `h1` and fixed scratch offsets | reconstructed intermediates and fresh scratch `h2` | fixed launches with device predicates | conditional peer publication and barrier |
 | 3 | postprocess backward / `broadcast_and_scale()` | `grad_output_TD`, router scores, and `h3` | BF16 `grad_h3` in symmetric combine HBM plus `grad_topk_scores_TK` | peer-visible until W2 DGRAD completes | combine barrier precedes peer reads |
 | 4 | `dist_grouped_gemm_dgrad_dispatch()` | peer `grad_h3` rows and W2 | BF16 `grad_h2` and gathered `grad_h3` | shared scratch | pointer-driven peer reads |
 | 5 | `grouped_gemm_wgrad()` | `grad_h3` and `h2` offsets | W2 gradient | caller-selected BF16/FP32 output or owned destination | same-stream dependency |
@@ -335,17 +335,17 @@ launches the fixed recompute sequence:
 
 1. `copy_activation_to_dispatch()` republishes saved `x` when required.
 2. Conditional `dist_grouped_gemm_fprop_dispatch()` recreates
-   `x_gathered/h1` without forward activation fusion.
-3. Standalone `swiglu_fwd()` always recreates scratch `h2` from the selected
-   saved or recomputed `h1`.
+   `x_gathered/h1` and emits `h2` when the forward epilogue's geometry and
+   activation support it.
+3. Standalone `swiglu_fwd()` rebuilds scratch `h2` when `h1` was saved, or
+   whenever the dispatch lacks a compatible epilogue.
 4. Conditional `dist_grouped_gemm_fprop_combine()` recreates `h3`.
 
-The host never reads `need_recompute`. FC13 and W2 recompute launches are
-device-predicated no-ops when their state was saved, but SwiGLU must still
-rebuild `h2`: another forward may have overwritten that shared scratch. This
-is why recompute keeps the standalone activation even when the original
-forward was fused. It does not recollect clip counters. No host branch on the
-saved-state decision or new activation allocation occurs during graph replay.
+The host never reads `need_recompute`. Another forward may overwrite shared
+`h2` scratch, so backward always recreates it. With an eligible epilogue,
+the standalone activation uses the inverse device predicate to cover the
+saved-`h1` path. Backward skips clip counting. The launches and planned
+activation addresses stay fixed across graph replay.
 
 ### 2. Router-score gradient and route output gradient
 
