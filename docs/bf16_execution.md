@@ -289,9 +289,12 @@ the two route results for local tokens `A` and `B`.
 direct callable or `dist_moe.RMSNormPostprocess`. A callable transforms route-wise `h3`
 before the ordinary reduction and selects eager execution. The RMSNorm policy
 uses the fused kernel after W2 combine to normalize each route in FP32,
-apply router scores, and reduce K. Scalarless RMSNorm supports training; the
-optional input-scale weight is inference-only. The fused path saves its rstd
-context and conditionally saves the pre-normalization `h3` in the same activation buffer.
+apply router scores, and reduce K. Scalarless RMSNorm and the optional
+input-scale weight both support training; the weighted form returns the
+weight gradient through autograd (see
+[Train a weighted norm](postprocess.md#train-a-weighted-norm)). The scalarless
+fused path saves its rstd context; both conditionally save the
+pre-normalization `h3` in the same activation buffer.
 
 <a id="state-retained-for-backward"></a>
 ## State retained for backward

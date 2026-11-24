@@ -2237,7 +2237,10 @@ class _Bf16Autograd(torch.autograd.Function):
             Gradients matching every ``forward`` argument.
         """
         (grad_output_TD,) = grad_outputs
-        return _Bf16Autograd._backward_impl(ctx, grad_output_TD)
+        # routed_experts rejects a differentiable RMSNorm weight on this path,
+        # whose inputs have no slot for its gradient.
+        gradients, _ = _Bf16Autograd._backward_impl(ctx, grad_output_TD)
+        return gradients
 
     @staticmethod
     def _backward_impl(  # noqa: C901 -- preserve the backward scratch and gradient ordering
@@ -2246,7 +2249,7 @@ class _Bf16Autograd(torch.autograd.Function):
         *,
         wgrad_destinations: tuple[_WgradDestination, _WgradDestination] | None = None,
         wgrad_output_dtype: torch.dtype | None = None,
-    ) -> tuple[Any, ...]:
+    ) -> tuple[tuple[Any, ...], torch.Tensor | None]:
         """Run recompute as needed, then dgrad and two explicit wgrad GEMMs.
 
         Args:
@@ -2256,7 +2259,8 @@ class _Bf16Autograd(torch.autograd.Function):
             wgrad_output_dtype: Optional resolved WGRAD kernel output dtype.
 
         Returns:
-            Gradients matching every ``forward`` argument.
+            Gradients matching every ``forward`` argument, and the gradient of
+            the fused RMSNorm weight, or ``None`` without a weighted norm.
         """
         # 1. Recover immutable call policy plus the device-resident planner and
         # routing state saved by the matching forward invocation.
@@ -2454,7 +2458,7 @@ class _Bf16Autograd(torch.autograd.Function):
 
         # 4. Reverse postprocessing before expert DGRAD/WGRAD so both paths
         # consume the same route-wise gradient representation.
-        grad_h3_MD, grad_topk_scores_TK, grad_h3_is_published = (
+        grad_h3_MD, grad_topk_scores_TK, grad_h3_is_published, grad_rmsnorm_weight_D = (
             ctx.postprocess.backward(
                 grad_output_TD,
                 h3_saved_MD,
@@ -2630,7 +2634,7 @@ class _Bf16Autograd(torch.autograd.Function):
             expert_ids=topk_expert_ids_TK,
         )
         external_wgrad_destination = options.wgrad_destination_fn is not None
-        return (
+        gradients = (
             grad_x_TD,
             None,  # topk_expert_ids_TK
             grad_topk_scores_TK,
@@ -2654,6 +2658,7 @@ class _Bf16Autograd(torch.autograd.Function):
             None,  # options
             None,  # save_for_backward
         )
+        return gradients, grad_rmsnorm_weight_D
 
 
 # Keep context-owned mutable storage explicit so tracing and CUDA graphs retain
@@ -3280,18 +3285,20 @@ def _run_bf16_registered_backward(
     topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     state_tensors: list[torch.Tensor],
+    rmsnorm_weight_D: torch.Tensor | None,
     rmsnorm_enabled: bool,
     rmsnorm_eps: float,
     rmsnorm_norm_output_dtype: torch.dtype,
     rmsnorm_output_dtype: torch.dtype,
     rmsnorm_require_bitwise: bool,
+    rmsnorm_gain_center: float,
     rmsnorm_use_kahan: bool,
     rmsnorm_recompute_rstd: bool,
     wgrad_output_dtype: torch.dtype,
     context_id: str,
     *,
     wgrad_destinations: tuple[_WgradDestination, _WgradDestination] | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Rebuild BF16 state and run the shared backward implementation.
 
     Args:
@@ -3302,11 +3309,13 @@ def _run_bf16_registered_backward(
         topk_scores_TK: Router scores from forward.
         state_tensors: Routing metadata followed by packed planner state whose
             final value is the original forward's selected-slot snapshot.
+        rmsnorm_weight_D: Optional input-scale gamma from forward.
         rmsnorm_enabled: Whether fused post-expert RMSNorm is selected.
         rmsnorm_eps: RMSNorm epsilon.
         rmsnorm_norm_output_dtype: Normalized route-output dtype.
         rmsnorm_output_dtype: Final reduction output dtype.
         rmsnorm_require_bitwise: Whether to preserve standalone reduction order.
+        rmsnorm_gain_center: Constant added to ``rmsnorm_weight_D``.
         rmsnorm_use_kahan: Whether to use compensated sum-of-squares.
         rmsnorm_recompute_rstd: Whether backward recomputes reciprocal RMS values.
         wgrad_output_dtype: Resolved BF16 or FP32 WGRAD output dtype.
@@ -3315,7 +3324,8 @@ def _run_bf16_registered_backward(
             for fresh functional WGRAD outputs.
 
     Returns:
-        Gradients for input, routing scores, w13, and w2.
+        Gradients for input, routing scores, w13, w2, and the RMSNorm weight;
+        the last is an empty placeholder without a weight.
     """
     if len(state_tensors) != 9:
         raise RuntimeError(f"BF16 backward received {len(state_tensors)} state tensors")
@@ -3332,13 +3342,13 @@ def _run_bf16_registered_backward(
     ) = state_tensors
     context = _get_context(context_id)
     postprocess_config = _rmsnorm_from_registered_args(
-        None,
+        rmsnorm_weight_D,
         rmsnorm_enabled,
         rmsnorm_eps,
         rmsnorm_norm_output_dtype,
         rmsnorm_output_dtype,
         rmsnorm_require_bitwise,
-        0.0,
+        rmsnorm_gain_center,
         rmsnorm_use_kahan,
         rmsnorm_recompute_rstd,
     )
@@ -3393,13 +3403,21 @@ def _run_bf16_registered_backward(
         activation_slot_id_1,
         None if postprocess_context.numel() == 0 else postprocess_context,
     )
-    gradients = _Bf16Autograd._backward_impl(
+    gradients, grad_rmsnorm_weight_D = _Bf16Autograd._backward_impl(
         kernel_ctx,
         grad_output_TD,
         wgrad_destinations=wgrad_destinations,
         wgrad_output_dtype=wgrad_output_dtype,
     )
-    return gradients[0], gradients[2], gradients[3], gradients[4]
+    if grad_rmsnorm_weight_D is None:
+        grad_rmsnorm_weight_D = grad_output_TD.new_empty(0)
+    return (
+        gradients[0],
+        gradients[2],
+        gradients[3],
+        gradients[4],
+        grad_rmsnorm_weight_D,
+    )
 
 
 @torch.library.custom_op(
@@ -3414,17 +3432,22 @@ def _bf16_backward_op(
     topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     state_tensors: list[torch.Tensor],
+    rmsnorm_weight_D: torch.Tensor | None,
     rmsnorm_enabled: bool,
     rmsnorm_eps: float,
     rmsnorm_norm_output_dtype: torch.dtype,
     rmsnorm_output_dtype: torch.dtype,
     rmsnorm_require_bitwise: bool,
+    rmsnorm_gain_center: float,
     rmsnorm_use_kahan: bool,
     rmsnorm_recompute_rstd: bool,
     wgrad_output_dtype: torch.dtype,
     context_id: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run BF16 backward and return fresh input, score, and weight gradients."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run BF16 backward and return fresh input, score, and weight gradients.
+
+    The last output is the RMSNorm weight gradient, or an empty placeholder.
+    """
     return _run_bf16_registered_backward(
         grad_output_TD,
         w13_EFD,
@@ -3432,11 +3455,13 @@ def _bf16_backward_op(
         topk_expert_ids_TK,
         topk_scores_TK,
         state_tensors,
+        rmsnorm_weight_D,
         rmsnorm_enabled,
         rmsnorm_eps,
         rmsnorm_norm_output_dtype,
         rmsnorm_output_dtype,
         rmsnorm_require_bitwise,
+        rmsnorm_gain_center,
         rmsnorm_use_kahan,
         rmsnorm_recompute_rstd,
         wgrad_output_dtype,
@@ -3459,17 +3484,23 @@ def _bf16_backward_accumulate_op(
     topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     state_tensors: list[torch.Tensor],
+    rmsnorm_weight_D: torch.Tensor | None,
     rmsnorm_enabled: bool,
     rmsnorm_eps: float,
     rmsnorm_norm_output_dtype: torch.dtype,
     rmsnorm_output_dtype: torch.dtype,
     rmsnorm_require_bitwise: bool,
+    rmsnorm_gain_center: float,
     rmsnorm_use_kahan: bool,
     rmsnorm_recompute_rstd: bool,
     wgrad_output_dtype: torch.dtype,
     context_id: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run BF16 backward and add WGRAD into explicit destinations."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run BF16 backward and add WGRAD into explicit destinations.
+
+    Returns input, score, and RMSNorm weight gradients; the last is an empty
+    placeholder without a weight.
+    """
     wgrad_destinations = _wgrad_accumulation_destinations(
         accumulator_grad_w13_EFD,
         accumulator_grad_w2_EDF,
@@ -3484,18 +3515,20 @@ def _bf16_backward_accumulate_op(
         topk_expert_ids_TK,
         topk_scores_TK,
         state_tensors,
+        rmsnorm_weight_D,
         rmsnorm_enabled,
         rmsnorm_eps,
         rmsnorm_norm_output_dtype,
         rmsnorm_output_dtype,
         rmsnorm_require_bitwise,
+        rmsnorm_gain_center,
         rmsnorm_use_kahan,
         rmsnorm_recompute_rstd,
         wgrad_output_dtype,
         context_id,
         wgrad_destinations=wgrad_destinations,
     )
-    return gradients[0], gradients[1]
+    return gradients[0], gradients[1], gradients[4]
 
 
 @_bf16_backward_op.register_fake
@@ -3506,11 +3539,13 @@ def _bf16_backward_fake(
     topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     state_tensors: list[torch.Tensor],
+    rmsnorm_weight_D: torch.Tensor | None,
     rmsnorm_enabled: bool,
     rmsnorm_eps: float,
     rmsnorm_norm_output_dtype: torch.dtype,
     rmsnorm_output_dtype: torch.dtype,
     rmsnorm_require_bitwise: bool,
+    rmsnorm_gain_center: float,
     rmsnorm_use_kahan: bool,
     rmsnorm_recompute_rstd: bool,
     wgrad_output_dtype: torch.dtype,
@@ -3525,28 +3560,32 @@ def _bf16_backward_fake(
         topk_expert_ids_TK: Fake expert IDs.
         topk_scores_TK: Fake router scores.
         state_tensors: Fake routing and activation-plan state.
+        rmsnorm_weight_D: Optional input-scale gamma from forward.
         rmsnorm_enabled: Whether fused post-expert RMSNorm is selected.
         rmsnorm_eps: RMSNorm epsilon.
         rmsnorm_norm_output_dtype: Normalized route-output dtype.
         rmsnorm_output_dtype: Final reduction output dtype.
         rmsnorm_require_bitwise: Whether to preserve standalone reduction order.
+        rmsnorm_gain_center: Constant added to ``rmsnorm_weight_D``.
         rmsnorm_use_kahan: Whether to use compensated sum-of-squares.
         rmsnorm_recompute_rstd: Whether backward recomputes reciprocal RMS values.
         wgrad_output_dtype: Resolved BF16 or FP32 weight-gradient dtype.
         context_id: Process-local context identifier.
 
     Returns:
-        Fake gradients for input, routing scores, w13, and w2.
+        Fake gradients for input, routing scores, w13, w2, and the RMSNorm
+        weight (an empty placeholder without a weight).
     """
     del topk_expert_ids_TK, state_tensors, rmsnorm_enabled
     del rmsnorm_eps, rmsnorm_norm_output_dtype, rmsnorm_output_dtype
-    del rmsnorm_require_bitwise, rmsnorm_use_kahan, rmsnorm_recompute_rstd
-    del context_id
+    del rmsnorm_require_bitwise, rmsnorm_gain_center, rmsnorm_use_kahan
+    del rmsnorm_recompute_rstd, context_id
     return (
         torch.empty_like(grad_output_TD),
         torch.empty_like(topk_scores_TK),
         w13_EFD.new_empty(w13_EFD.shape, dtype=wgrad_output_dtype),
         w2_EDF.new_empty(w2_EDF.shape, dtype=wgrad_output_dtype),
+        _fake_rmsnorm_weight_grad(grad_output_TD, rmsnorm_weight_D),
     )
 
 
@@ -3560,21 +3599,23 @@ def _bf16_backward_accumulate_fake(
     topk_expert_ids_TK: torch.Tensor,
     topk_scores_TK: torch.Tensor,
     state_tensors: list[torch.Tensor],
+    rmsnorm_weight_D: torch.Tensor | None,
     rmsnorm_enabled: bool,
     rmsnorm_eps: float,
     rmsnorm_norm_output_dtype: torch.dtype,
     rmsnorm_output_dtype: torch.dtype,
     rmsnorm_require_bitwise: bool,
+    rmsnorm_gain_center: float,
     rmsnorm_use_kahan: bool,
     rmsnorm_recompute_rstd: bool,
     wgrad_output_dtype: torch.dtype,
     context_id: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return non-WGRAD metadata for a fake accumulating BF16 backward."""
     del topk_expert_ids_TK, state_tensors, rmsnorm_enabled
     del rmsnorm_eps, rmsnorm_norm_output_dtype, rmsnorm_output_dtype
-    del rmsnorm_require_bitwise, rmsnorm_use_kahan, rmsnorm_recompute_rstd
-    del context_id
+    del rmsnorm_require_bitwise, rmsnorm_gain_center, rmsnorm_use_kahan
+    del rmsnorm_recompute_rstd, context_id
     _wgrad_accumulation_destinations(
         accumulator_grad_w13_EFD,
         accumulator_grad_w2_EDF,
@@ -3582,7 +3623,29 @@ def _bf16_backward_accumulate_fake(
         w2_EDF,
         wgrad_output_dtype,
     )
-    return torch.empty_like(grad_output_TD), torch.empty_like(topk_scores_TK)
+    return (
+        torch.empty_like(grad_output_TD),
+        torch.empty_like(topk_scores_TK),
+        _fake_rmsnorm_weight_grad(grad_output_TD, rmsnorm_weight_D),
+    )
+
+
+def _fake_rmsnorm_weight_grad(
+    grad_output_TD: torch.Tensor,
+    rmsnorm_weight_D: torch.Tensor | None,
+) -> torch.Tensor:
+    """Return fake RMSNorm weight-gradient metadata.
+
+    Args:
+        grad_output_TD: Fake output gradient, used for an empty placeholder.
+        rmsnorm_weight_D: Fake optional input-scale gamma.
+
+    Returns:
+        A tensor shaped like the weight, or an empty placeholder.
+    """
+    if rmsnorm_weight_D is None:
+        return grad_output_TD.new_empty(0)
+    return torch.empty_like(rmsnorm_weight_D)
 
 
 _bf16_backward_op.register_effect(torch.library.EffectType.ORDERED)
@@ -3614,13 +3677,13 @@ def _bf16_setup_context(
         topk_scores_TK,
         w13_EFD,
         w2_EDF,
-        _rmsnorm_weight_D,
+        rmsnorm_weight_D,
         rmsnorm_enabled,
         rmsnorm_eps,
         rmsnorm_norm_output_dtype,
         rmsnorm_output_dtype,
         rmsnorm_require_bitwise,
-        _rmsnorm_gain_center,
+        rmsnorm_gain_center,
         rmsnorm_use_kahan,
         rmsnorm_recompute_rstd,
         _activation_slot_id_1,
@@ -3635,6 +3698,7 @@ def _bf16_setup_context(
     ctx.rmsnorm_norm_output_dtype = rmsnorm_norm_output_dtype
     ctx.rmsnorm_output_dtype = rmsnorm_output_dtype
     ctx.rmsnorm_require_bitwise = rmsnorm_require_bitwise
+    ctx.rmsnorm_gain_center = rmsnorm_gain_center
     ctx.rmsnorm_use_kahan = rmsnorm_use_kahan
     ctx.rmsnorm_recompute_rstd = rmsnorm_recompute_rstd
     ctx.set_materialize_grads(False)
@@ -3645,6 +3709,7 @@ def _bf16_setup_context(
         w2_EDF,
         topk_expert_ids_TK,
         topk_scores_TK,
+        rmsnorm_weight_D,
         *state_tensors,
     )
 
@@ -3665,9 +3730,14 @@ def _bf16_autograd_backward(
         Gradients matching the BF16 forward operator inputs.
     """
     del unused_state_gradients
-    w13_EFD, w2_EDF, topk_expert_ids_TK, topk_scores_TK, *state_tensors = (
-        ctx.saved_tensors
-    )
+    (
+        w13_EFD,
+        w2_EDF,
+        topk_expert_ids_TK,
+        topk_scores_TK,
+        rmsnorm_weight_D,
+        *state_tensors,
+    ) = ctx.saved_tensors
     inplace_wgrad_accum = getattr(ctx, "inplace_wgrad_accum", False)
     w13_compute_EFD = (
         w13_EFD.view(ctx.w13_compute_shape) if inplace_wgrad_accum else w13_EFD
@@ -3691,11 +3761,13 @@ def _bf16_autograd_backward(
         topk_expert_ids_TK,
         topk_scores_TK,
         state_tensors,
+        rmsnorm_weight_D,
         ctx.rmsnorm_enabled,
         ctx.rmsnorm_eps,
         ctx.rmsnorm_norm_output_dtype,
         ctx.rmsnorm_output_dtype,
         ctx.rmsnorm_require_bitwise,
+        ctx.rmsnorm_gain_center,
         ctx.rmsnorm_use_kahan,
         ctx.rmsnorm_recompute_rstd,
         wgrad_output_dtype,
@@ -3708,17 +3780,25 @@ def _bf16_autograd_backward(
         accumulator_grad_w2_EDF = wgrad_destinations[1].output
         assert accumulator_grad_w13_EFD is not None
         assert accumulator_grad_w2_EDF is not None
-        grad_x_TD, grad_topk_scores_TK = _bf16_backward_accumulate_op(
-            grad_output_TD,
-            w13_compute_EFD,
-            w2_compute_EDF,
-            accumulator_grad_w13_EFD,
-            accumulator_grad_w2_EDF,
-            *registered_args,
+        grad_x_TD, grad_topk_scores_TK, grad_rmsnorm_weight_D = (
+            _bf16_backward_accumulate_op(
+                grad_output_TD,
+                w13_compute_EFD,
+                w2_compute_EDF,
+                accumulator_grad_w13_EFD,
+                accumulator_grad_w2_EDF,
+                *registered_args,
+            )
         )
         grad_w13_EFD = grad_w2_EDF = None
     else:
-        grad_x_TD, grad_topk_scores_TK, grad_w13_EFD, grad_w2_EDF = _bf16_backward_op(
+        (
+            grad_x_TD,
+            grad_topk_scores_TK,
+            grad_w13_EFD,
+            grad_w2_EDF,
+            grad_rmsnorm_weight_D,
+        ) = _bf16_backward_op(
             grad_output_TD,
             w13_compute_EFD,
             w2_compute_EDF,
@@ -3733,7 +3813,7 @@ def _bf16_autograd_backward(
         grad_topk_scores_TK,
         grad_w13_EFD,
         grad_w2_EDF,
-        None,  # rmsnorm_weight_D
+        None if grad_rmsnorm_weight_D.numel() == 0 else grad_rmsnorm_weight_D,
         None,  # rmsnorm_enabled
         None,  # rmsnorm_eps
         None,  # rmsnorm_norm_output_dtype
@@ -4050,6 +4130,24 @@ def routed_experts(  # noqa: C901
             rmsnorm_weight_D,
         )
     )
+    if rmsnorm_weight_D is not None and not context.config.inference:
+        if context.config.block_scaled is not None:
+            raise ValueError(
+                "RMSNormPostprocess weight (input-scale gamma) supports "
+                "block-scaled inference only; training with a weighted "
+                "post-expert norm must use a callback postprocess"
+            )
+        if (
+            save_for_backward
+            and rmsnorm_weight_D.requires_grad
+            and options.requires_eager
+        ):
+            # The eager autograd boundary has no input for the weight.
+            raise ValueError(
+                "a differentiable RMSNormPostprocess weight requires the "
+                "registered execution path; remove the Python callbacks from "
+                "ExecutionOptions"
+            )
     if context.config.block_scaled is not None:
         # Importing registers the separate dispatcher schema without adding
         # low-precision compiler dependencies to BF16-only processes.
