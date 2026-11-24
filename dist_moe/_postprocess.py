@@ -22,14 +22,18 @@ _ExpertsOutputPostprocessFn = Callable[[torch.Tensor], torch.Tensor]
 class RMSNormPostprocess:
     """Configuration for fused RMSNorm and top-k reduction.
 
-    Scalarless by default. An input-scale gamma — the
-    ``rmsnorm((weight + gain_center) * x)`` form used by weighted post-expert
-    norms — is supported for INFERENCE ONLY by setting ``weight`` (and, for
-    zero-centered gamma, ``gain_center=1.0``): the gamma is applied inside the
-    single fused kernel, with no extra pre-scaling launch. Training with a
-    weighted norm must use a callback, or fold the effective gamma (including
-    any gain center) into the corresponding output rows of ``w2`` for
-    inference from pre-quantized weights.
+    Scalarless by default. Setting ``weight`` (and, for zero-centered gamma,
+    ``gain_center=1.0``) selects the input-scale form
+    ``rmsnorm((weight + gain_center) * x)`` used by weighted post-expert norms.
+    The gamma is applied inside the single fused forward kernel, with no extra
+    pre-scaling launch. Inference supports it with every option except
+    ``use_kahan``. BF16 training supports it with ``require_bitwise=False``
+    and no observers: forward saves only the route output, and backward
+    recomputes the reciprocal RMS while it computes the route, score, and
+    ``weight`` gradients in one pass. ``weight`` then receives its gradient
+    through ordinary autograd, so pass the live parameter (for example the
+    FSDP-unsharded tensor) on every call. Block-scaled training with a weight
+    still requires a callback.
 
     Supported hidden dimensions are multiples of 128 from 256 through 131072.
     Bitwise backward follows the standalone projection and score-gradient
@@ -61,9 +65,11 @@ class RMSNormPostprocess:
         output_dtype: Dtype of the score-weighted token output.
         require_bitwise: Whether to preserve standalone reduction order.
         weight: Optional contiguous CUDA input-scale gamma with shape ``[D]``
-            and the DistMoE input dtype. It is inference-only and cannot be
-            combined with Kahan accumulation; full validation is deferred
-            until :func:`dist_moe.routed_experts` knows the selected execution mode.
+            and the DistMoE input dtype. It cannot be combined with Kahan
+            accumulation. Training additionally requires BF16 execution,
+            ``require_bitwise=False``, and no observers. Full validation is
+            deferred until :func:`dist_moe.routed_experts` knows the selected
+            execution mode.
         gain_center: Constant added to ``weight`` before input scaling.
         use_kahan: Whether to use compensated sum-of-squares.
         observe_expert_output_fn: Optional read-only forward observer.
@@ -75,9 +81,8 @@ class RMSNormPostprocess:
     norm_output_dtype: torch.dtype
     output_dtype: torch.dtype
     require_bitwise: bool = True
-    # Optional inference-only input-scale gamma: a contiguous [DIM] tensor
-    # matching the DistMoE input dtype. ``gain_center`` is added to it inside
-    # the kernel.
+    # Optional input-scale gamma: a contiguous [DIM] tensor matching the
+    # DistMoE input dtype. ``gain_center`` is added to it inside the kernel.
     weight: torch.Tensor | None = None
     gain_center: float = 0.0
     use_kahan: bool = False
@@ -276,23 +281,29 @@ class _ResolvedExpertsPostprocess:
     ``backward(grad_output, h3_saved, scores, *, postprocess_output_dtype,
     context, publish_view, x_buffer,
     x_buffer_offset, x_buffer_condition)`` returns
-    ``(grad_h3, grad_scores, published)``. ``publish_view`` is a
+    ``(grad_h3, grad_scores, published, grad_weight)``. ``publish_view`` is a
     ``(shape, dtype) -> Tensor`` factory for the buffer the caller wants
     ``grad_h3`` published into; variants that cannot write their gradient
-    directly ignore it and return ``published=False``. ``x_buffer*`` let the
-    postprocess-free variant read the reduction input straight from the
-    activation buffer.
+    directly ignore it and return ``published=False``. ``x_buffer*`` let
+    variants that set ``fuses_saved_copy_into_reduction`` read the saved
+    route output straight from the activation buffer. ``grad_weight`` is the
+    gradient of ``RMSNormPostprocess.weight`` for the weighted training
+    variant and ``None`` otherwise.
     """
 
     forward: Callable[
         ...,
         tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.dtype],
     ]
-    backward: Callable[..., tuple[torch.Tensor, torch.Tensor, bool]]
+    backward: Callable[
+        ...,
+        tuple[torch.Tensor, torch.Tensor, bool, torch.Tensor | None],
+    ]
     includes_scale_and_sum: bool
-    # True when forward fuses the saved-h3 copy into the reduction launch and
-    # backward reads the reduction input straight from an aliased buffer (the
-    # postprocess-free variant). Callers use it to decide buffer staging.
+    # True when forward saves h3 itself and backward reads the saved h3
+    # straight from the activation buffer through ``x_buffer*`` (the
+    # postprocess-free and weighted RMSNorm training variants). Callers then
+    # skip staging the saved h3 into the recompute destination.
     fuses_saved_copy_into_reduction: bool = False
 
 
@@ -726,7 +737,7 @@ def _validate_rmsnorm_weight(
     expert_output_dim: int,
     inference_mode: bool,
 ) -> None:
-    """Validate the optional inference-only RMSNorm input scale.
+    """Validate the optional RMSNorm input scale for the execution mode.
 
     Args:
         config: Public fused RMSNorm policy.
@@ -764,11 +775,22 @@ def _validate_rmsnorm_weight(
             f"{tuple(config.weight.shape)} dtype {config.weight.dtype} for "
             f"dim={expert_output_dim}, input_dtype={expert_output_dtype}"
         )
-    if not inference_mode:
+    if inference_mode:
+        return
+    if config.require_bitwise:
         raise ValueError(
-            "RMSNormPostprocess weight (input-scale gamma) is "
-            "inference/forward-only; training with a weighted post-expert "
-            "norm must use a callback postprocess"
+            "training with RMSNormPostprocess weight requires "
+            "require_bitwise=False: its backward has no bitwise standalone "
+            "reference"
+        )
+    if (
+        config.observe_expert_output_fn is not None
+        or config.observe_expert_output_grad_fn is not None
+    ):
+        # Observers select eager execution, whose autograd boundary has no
+        # input for the weight and so cannot return its gradient.
+        raise ValueError(
+            "training with RMSNormPostprocess weight does not support observers"
         )
 
 
@@ -810,6 +832,13 @@ def _resolve_experts_output_postprocess_fn(
             topk,
             topk_expert_ids_TK,
             zero_out_padded_inputs=zero_out_padded_callback_inputs,
+        )
+    if experts_output_postprocess.weight is not None and not inference_mode:
+        return _resolve_weighted_rmsnorm_training(
+            experts_output_postprocess,
+            x_TD=x_TD,
+            topk_expert_ids_TK=topk_expert_ids_TK,
+            topk_scores_TK=topk_scores_TK,
         )
     return _resolve_rmsnorm_config(
         experts_output_postprocess,
@@ -909,7 +938,7 @@ def _resolve_reduction_only(
         x_buffer: torch.Tensor | None = None,
         x_buffer_offset: torch.Tensor | None = None,
         x_buffer_condition: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    ) -> tuple[torch.Tensor, torch.Tensor, bool, torch.Tensor | None]:
         """Differentiate plain score weighting and top-k reduction.
 
         Args:
@@ -924,8 +953,8 @@ def _resolve_reduction_only(
             x_buffer_condition: Device predicate selecting the activation-buffer value.
 
         Returns:
-            Route gradient, router-score gradient, and whether the route
-            gradient was written directly to ``publish_view``.
+            Route gradient, router-score gradient, whether the route gradient
+            was written directly to ``publish_view``, and no weight gradient.
         """
         h3_saved_TKD = h3_saved_MD.view(num_tokens, topk, -1)
         grad_h3_output_TKD = (
@@ -948,6 +977,7 @@ def _resolve_reduction_only(
             grad_h3_TKD.view_as(h3_saved_MD),
             grad_scores_TK,
             grad_h3_output_TKD is not None,
+            None,
         )
 
     return _ResolvedExpertsPostprocess(
@@ -1100,7 +1130,7 @@ def _resolve_callback(
         x_buffer: torch.Tensor | None = None,
         x_buffer_offset: torch.Tensor | None = None,
         x_buffer_condition: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    ) -> tuple[torch.Tensor, torch.Tensor, bool, torch.Tensor | None]:
         """Replay a direct callback and differentiate it plus reduction.
 
         Args:
@@ -1116,8 +1146,9 @@ def _resolve_callback(
             x_buffer_condition: Unused activation-buffer predicate.
 
         Returns:
-            Callback-input gradient, router-score gradient, and ``False``
-            because the gradient has not been published.
+            Callback-input gradient, router-score gradient, ``False``
+            because the gradient has not been published, and no weight
+            gradient; callback parameters accumulate through nested autograd.
         """
         if zero_out_padded_inputs:
             zero_out_padded_rows_(h3_saved_MD, expert_ids_TK)
@@ -1141,7 +1172,7 @@ def _resolve_callback(
             h3_postprocessed_MD.backward(grad_h3_post_TKD.view_as(h3_postprocessed_MD))
         grad_h3_MD = h3_pre_MD.grad
         assert grad_h3_MD is not None
-        return grad_h3_MD, grad_scores_TK, False
+        return grad_h3_MD, grad_scores_TK, False, None
 
     return _ResolvedExpertsPostprocess(
         forward=forward,
@@ -1368,7 +1399,7 @@ def _resolve_rmsnorm_config(
         x_buffer: torch.Tensor | None = None,
         x_buffer_offset: torch.Tensor | None = None,
         x_buffer_condition: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    ) -> tuple[torch.Tensor, torch.Tensor, bool, torch.Tensor | None]:
         """Run fused RMSNorm and score-reduction backward.
 
         Args:
@@ -1383,8 +1414,8 @@ def _resolve_rmsnorm_config(
             x_buffer_condition: Unused activation-buffer predicate.
 
         Returns:
-            Route gradient, router-score gradient, and whether the route
-            gradient was written directly to ``publish_view``.
+            Route gradient, router-score gradient, whether the route gradient
+            was written directly to ``publish_view``, and no weight gradient.
         """
         validate_inputs(h3_saved_MD, scores_TK)
         if (
@@ -1410,10 +1441,183 @@ def _resolve_rmsnorm_config(
         )
         if config.observe_expert_output_grad_fn is not None:
             config.observe_expert_output_grad_fn(h3_saved_MD, grad_h3_MD)
-        return grad_h3_MD, grad_scores_TK, published
+        return grad_h3_MD, grad_scores_TK, published, None
 
     return _ResolvedExpertsPostprocess(
         forward=forward,
         backward=backward,
         includes_scale_and_sum=True,
+    )
+
+
+def _resolve_weighted_rmsnorm_training(
+    config: RMSNormPostprocess,
+    *,
+    x_TD: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,
+    topk_scores_TK: torch.Tensor,
+) -> _ResolvedExpertsPostprocess:
+    """Resolve input-scaled fused RMSNorm plus reduction for training.
+
+    Forward runs the fused weighted kernel and saves only the route output.
+    Backward reads that output from the activation buffer when it was not
+    recomputed, recomputes the reciprocal RMS, and returns the route, score,
+    and ``config.weight`` gradients from one kernel.
+
+    Args:
+        config: Public fused RMSNorm policy with a weight.
+        x_TD: Dist-MoE input that defines the output dtype and hidden width.
+        topk_expert_ids_TK: Routed expert IDs with shape ``[T, K]``.
+        topk_scores_TK: Router scores with shape ``[T, K]``.
+
+    Returns:
+        Validated forward and backward hooks for weighted RMSNorm reduction.
+    """
+    from ._triton_ops import conditional_copy_activations
+
+    num_tokens, topk = topk_scores_TK.shape
+    hidden_dim = x_TD.shape[-1]
+    _validate_rmsnorm_postprocess(
+        config,
+        expert_output_dtype=x_TD.dtype,
+        expert_output_dim=hidden_dim,
+        topk_scores_TK=topk_scores_TK,
+        inference_mode=False,
+    )
+    weight_D = config.weight
+    assert weight_D is not None
+    validate_inputs = partial(
+        _validate_rmsnorm_stage_inputs,
+        expected_h3_shapes=(
+            (num_tokens, topk, hidden_dim),
+            (num_tokens * topk, hidden_dim),
+        ),
+        num_tokens=num_tokens,
+        topk=topk,
+        input_dtype=x_TD.dtype,
+    )
+
+    def forward(
+        h3_MD: torch.Tensor,
+        scores_TK: torch.Tensor,
+        *,
+        output_dtype: torch.dtype,
+        save: bool,
+        save_requires_copy: bool = True,
+        save_buffer: torch.Tensor | None = None,
+        save_offset: torch.Tensor | None = None,
+        save_condition: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.dtype]:
+        """Run weighted fused RMSNorm/reduction and save the route output.
+
+        Args:
+            h3_MD: Route-wise W2 output.
+            scores_TK: Router scores.
+            output_dtype: Requested reduced-output dtype.
+            save: Whether backward state is required.
+            save_requires_copy: Whether ``h3_MD`` aliases reusable storage.
+            save_buffer: Optional activation buffer for the saved route output.
+            save_offset: Byte offset into ``save_buffer``.
+            save_condition: Device predicate controlling the buffer save.
+
+        Returns:
+            Reduced output, optional saved route output, no auxiliary context
+            because backward recomputes the reciprocal RMS, and the
+            reduction-output dtype.
+        """
+        assert output_dtype == config.output_dtype, (
+            "RMSNormPostprocess output_dtype must match the reduction dtype; "
+            f"got config {config.output_dtype} vs requested {output_dtype}"
+        )
+        validate_inputs(h3_MD, scores_TK)
+        h3_saved_MD = None
+        if save and save_buffer is not None:
+            assert save_offset is not None and save_condition is not None
+            conditional_copy_activations(
+                condition=save_condition,
+                lhs=None,
+                lhs_offset=None,
+                rhs=h3_MD,
+                rhs_offset=save_offset,
+                activation_buffer=save_buffer,
+                copy_to_buffer=True,
+            )
+        elif save:
+            # The weighted forward kernel has no fused input copy.
+            h3_saved_MD = h3_MD.clone() if save_requires_copy else h3_MD
+        output_TD = _fused_post_expert_rmsnorm(
+            h3_MD,
+            topk_expert_ids_TK,
+            scores_TK,
+            config,
+            num_tokens=num_tokens,
+            topk=topk,
+        )
+        return output_TD, h3_saved_MD, None, config.output_dtype
+
+    def backward(
+        grad_output_TD: torch.Tensor,
+        h3_saved_MD: torch.Tensor,
+        scores_TK: torch.Tensor,
+        *,
+        postprocess_output_dtype: torch.dtype,
+        context: torch.Tensor | None = None,
+        publish_view: Callable[[tuple[int, ...], torch.dtype], torch.Tensor]
+        | None = None,
+        x_buffer: torch.Tensor | None = None,
+        x_buffer_offset: torch.Tensor | None = None,
+        x_buffer_condition: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool, torch.Tensor | None]:
+        """Differentiate weighted RMSNorm, score weighting, and reduction.
+
+        Args:
+            grad_output_TD: Gradient of the reduced output with shape ``[T, D]``.
+            h3_saved_MD: Recomputed route output, or the recompute destination
+                when ``x_buffer_condition`` selects the activation buffer.
+            scores_TK: Router scores with shape ``[T, K]``.
+            postprocess_output_dtype: Forward reduction-output dtype.
+            context: Unused auxiliary context.
+            publish_view: Optional symmetric-memory gradient destination.
+            x_buffer: Optional activation buffer containing the saved output.
+            x_buffer_offset: Byte offset into ``x_buffer``.
+            x_buffer_condition: Device predicate selecting ``h3_saved_MD``
+                when nonzero and the activation-buffer copy otherwise.
+
+        Returns:
+            Route gradient, router-score gradient, whether the route gradient
+            was written directly to ``publish_view``, and the weight gradient.
+        """
+        from .kernels.triton.input_scaled_rmsnorm_combine import (
+            input_scaled_rmsnorm_combine_bwd,
+        )
+
+        validate_inputs(h3_saved_MD, scores_TK)
+        grad_h3_output_MD, published = _grad_publish_target(
+            publish_view,
+            h3_saved_MD,
+            preserve_h3_saved=False,
+        )
+        rows_shape = (num_tokens * topk, hidden_dim)
+        grad_h3_MD, grad_scores_TK, grad_weight_D = input_scaled_rmsnorm_combine_bwd(
+            grad_output_TD.contiguous(),
+            h3_saved_MD.view(rows_shape),
+            weight_D,
+            scores_TK,
+            topk_expert_ids_TK,
+            eps=config.eps,
+            gain_center=config.gain_center,
+            grad_x_MD=grad_h3_output_MD.view(rows_shape),
+            x_buffer=x_buffer,
+            x_buffer_offset=x_buffer_offset,
+            x_buffer_condition=x_buffer_condition,
+        )
+        if not topk_scores_TK.requires_grad:
+            grad_scores_TK.zero_()
+        return grad_h3_MD.view_as(h3_saved_MD), grad_scores_TK, published, grad_weight_D
+
+    return _ResolvedExpertsPostprocess(
+        forward=forward,
+        backward=backward,
+        includes_scale_and_sum=True,
+        fuses_saved_copy_into_reduction=True,
     )

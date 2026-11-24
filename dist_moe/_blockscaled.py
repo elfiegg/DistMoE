@@ -2287,20 +2287,24 @@ class _BlockScaledAutograd(torch.autograd.Function):
         # 5. Reverse postprocessing and publish route-wise gradients before
         # either staged or Mega expert backward consumes them.
         with record_function("moe_backward_postprocess"):
-            grad_h3, grad_topk_scores_TK, grad_h3_is_published = postprocess.backward(
-                grad_output_TD,
-                h3_saved,
-                topk_scores_TK,
-                postprocess_output_dtype=expert_postprocess_output_dtype,
-                context=postprocess_context,
-                publish_view=lambda shape, dtype: _local_symm_mem_buffer_view(
-                    combine_buffer,
-                    shape,
-                    dtype,
-                ),
-                x_buffer=activation_buffer.buffer,
-                x_buffer_offset=forward_plan.h3_offset,
-                x_buffer_condition=conditional_recompute,
+            # routed_experts rejects weighted RMSNorm training here, so there is
+            # no weight gradient to return.
+            grad_h3, grad_topk_scores_TK, grad_h3_is_published, _ = (
+                postprocess.backward(
+                    grad_output_TD,
+                    h3_saved,
+                    topk_scores_TK,
+                    postprocess_output_dtype=expert_postprocess_output_dtype,
+                    context=postprocess_context,
+                    publish_view=lambda shape, dtype: _local_symm_mem_buffer_view(
+                        combine_buffer,
+                        shape,
+                        dtype,
+                    ),
+                    x_buffer=activation_buffer.buffer,
+                    x_buffer_offset=forward_plan.h3_offset,
+                    x_buffer_condition=conditional_recompute,
+                )
             )
             del grad_output_TD, h3_saved
 

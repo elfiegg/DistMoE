@@ -3320,6 +3320,230 @@ class DistMoeKernelTest(unittest.TestCase):
             )
         self._assert_planner_reset(context.activation_buffer)
 
+    def test_bf16_weighted_rmsnorm_trains_gamma(self) -> None:
+        """Match weighted RMSNorm training, including the gamma gradient.
+
+        The registered path must return the input-scale gamma gradient through
+        autograd alongside the input, score, and expert-weight gradients, and a
+        padded token must stay zero. Comparisons are tolerance-based against
+        an FP32 eager composition. The kernel test below covers the recomputed
+        and in-place inputs that this saved-activation case does not.
+        """
+        eps, gain_center = 1e-6, 1.0
+        context, case_a, _, w13_EFD, w2_EDF = self._create_case(inference=False)
+        x_TD, topk_expert_ids_TK, topk_scores_TK = case_a
+        topk_expert_ids_TK = topk_expert_ids_TK.clone()
+        topk_expert_ids_TK[0] = -1
+        topk_scores_TK = topk_scores_TK.clone()
+        topk_scores_TK[0] = 0
+        gamma_D = 0.1 * torch.randn(x_TD.shape[-1], device="cuda", dtype=torch.bfloat16)
+        actual_inputs = tuple(
+            tensor.detach().clone().requires_grad_()
+            for tensor in (x_TD, topk_scores_TK, w13_EFD, w2_EDF, gamma_D)
+        )
+        reference_inputs = tuple(
+            tensor.detach().clone().requires_grad_() for tensor in actual_inputs
+        )
+        reference_gamma_D = reference_inputs[4]
+        options = dist_moe.ExecutionOptions(
+            experts_output_postprocess=dist_moe.RMSNormPostprocess(
+                eps=eps,
+                norm_output_dtype=torch.float32,
+                output_dtype=torch.bfloat16,
+                require_bitwise=False,
+                weight=actual_inputs[4],
+                gain_center=gain_center,
+            )
+        )
+
+        actual_TD = dist_moe.routed_experts(
+            actual_inputs[0],
+            topk_expert_ids_TK,
+            *actual_inputs[1:4],
+            context,
+            options=options,
+        )
+        expected_TD = _reference_moe(
+            reference_inputs[0],
+            topk_expert_ids_TK,
+            *reference_inputs[1:4],
+            experts_output_postprocess=lambda h3_KD: F.rms_norm(
+                h3_KD.float() * (reference_gamma_D.float() + gain_center),
+                (h3_KD.shape[-1],),
+                eps=eps,
+            ),
+        )
+        grad_output_TD = torch.randn_like(actual_TD)
+        actual_TD.backward(grad_output_TD)
+        expected_TD.backward(grad_output_TD)
+
+        self.assertEqual(torch.count_nonzero(actual_TD[0]).item(), 0)
+        torch.testing.assert_close(actual_TD, expected_TD, rtol=2e-2, atol=2e-2)
+        for name, actual, expected in zip(
+            ("x", "topk_scores", "w13", "w2", "gamma"),
+            actual_inputs,
+            reference_inputs,
+            strict=True,
+        ):
+            self.assertIsNotNone(actual.grad, f"missing {name} gradient")
+            torch.testing.assert_close(
+                actual.grad,
+                expected.grad,
+                rtol=3e-2,
+                atol=3e-2,
+                msg=lambda message, name=name: f"{name}: {message}",
+            )
+        self._assert_planner_reset(context.activation_buffer)
+
+    def test_bf16_weighted_rmsnorm_rejects_unsupported_training(self) -> None:
+        """Reject weighted training modes that cannot return a gamma gradient.
+
+        Each case raises before any kernel launch with a message naming the
+        unsupported option, so no configuration silently drops the gradient.
+        """
+        context, case_a, _, w13_EFD, w2_EDF = self._create_case(inference=False)
+        x_TD, topk_expert_ids_TK, topk_scores_TK = case_a
+        gamma_D = torch.zeros(
+            x_TD.shape[-1], device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        base = dist_moe.RMSNormPostprocess(
+            eps=1e-6,
+            norm_output_dtype=torch.float32,
+            output_dtype=torch.bfloat16,
+            require_bitwise=False,
+            weight=gamma_D,
+            gain_center=1.0,
+        )
+        cases = (
+            (
+                dist_moe.ExecutionOptions(
+                    experts_output_postprocess=dataclasses.replace(
+                        base, require_bitwise=True
+                    )
+                ),
+                "require_bitwise=False",
+            ),
+            (
+                dist_moe.ExecutionOptions(
+                    experts_output_postprocess=dataclasses.replace(
+                        base, observe_expert_output_fn=lambda _value: None
+                    )
+                ),
+                "observers",
+            ),
+            (
+                dist_moe.ExecutionOptions(
+                    experts_output_postprocess=base,
+                    weights_preprocess_fn=lambda weight: weight,
+                ),
+                "registered execution path",
+            ),
+        )
+        for options, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    dist_moe.routed_experts(
+                        x_TD.detach().clone().requires_grad_(),
+                        topk_expert_ids_TK,
+                        topk_scores_TK,
+                        w13_EFD,
+                        w2_EDF,
+                        context,
+                        options=options,
+                    )
+
+    def test_input_scaled_rmsnorm_combine_bwd_reads_selected_input(self) -> None:
+        """Match the weighted backward kernel for every input source.
+
+        The kernel must give the same gradients when it reads the route input
+        from the tensor, from the activation buffer selected by the device
+        predicate, and when it writes the route gradient over that input.
+        Padded routes receive exact zeros; other values use a tolerance
+        against FP64 autograd of the forward formula with its BF16 rounding
+        points.
+        """
+        from dist_moe.kernels.triton.input_scaled_rmsnorm_combine import (
+            input_scaled_rmsnorm_combine_bwd,
+        )
+
+        torch.manual_seed(0)
+        num_tokens, topk, dim, eps, gain_center = 96, 8, 1024, 1e-6, 1.0
+        x_MD = torch.randn(num_tokens * topk, dim, device="cuda", dtype=torch.bfloat16)
+        weight_D = 0.1 * torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+        expert_ids_TK = torch.randint(0, 4, (num_tokens, topk), device="cuda")
+        expert_ids_TK[::5, 3] = -1
+        scores_TK = torch.where(
+            expert_ids_TK >= 0, torch.rand(num_tokens, topk, device="cuda"), 0.0
+        )
+        grad_y_TD = torch.randn(num_tokens, dim, device="cuda", dtype=torch.bfloat16)
+
+        def round_through(value: torch.Tensor) -> torch.Tensor:
+            """Round to BF16 like forward while keeping an identity gradient."""
+            return value + (value.bfloat16().double() - value).detach()
+
+        x_ref = x_MD.double().requires_grad_()
+        weight_ref = weight_D.double().requires_grad_()
+        scores_ref = scores_TK.double().requires_grad_()
+        scaled = round_through(x_ref * round_through(weight_ref + gain_center))
+        normalized = scaled * torch.rsqrt(scaled.square().mean(-1, keepdim=True) + eps)
+        active = (expert_ids_TK.reshape(-1, 1) >= 0).double()
+        y_ref = (
+            (scores_ref.reshape(-1, 1) * normalized * active)
+            .view(num_tokens, topk, dim)
+            .sum(1)
+        )
+        y_ref.backward(grad_y_TD.double())
+
+        buffer = torch.zeros(
+            x_MD.numel() * x_MD.element_size() + 256,
+            device="cuda",
+            dtype=torch.uint8,
+        )
+        offset_1 = torch.tensor([128], device="cuda", dtype=torch.int64)
+        buffer[128 : 128 + x_MD.numel() * 2].view(torch.bfloat16).copy_(
+            x_MD.reshape(-1)
+        )
+        for source in ("tensor", "buffer", "alias"):
+            with self.subTest(source=source):
+                x_arg = x_MD.clone()
+                kwargs: dict[str, Any] = {}
+                if source == "buffer":
+                    x_arg.zero_()  # Proves the buffer, not the tensor, is read.
+                    kwargs = {
+                        "x_buffer": buffer,
+                        "x_buffer_offset": offset_1,
+                        "x_buffer_condition": torch.zeros(
+                            1, device="cuda", dtype=torch.int32
+                        ),
+                    }
+                if source == "alias":
+                    kwargs = {"grad_x_MD": x_arg}
+                grad_x, grad_scores, grad_weight = input_scaled_rmsnorm_combine_bwd(
+                    grad_y_TD,
+                    x_arg,
+                    weight_D,
+                    scores_TK,
+                    expert_ids_TK,
+                    eps=eps,
+                    gain_center=gain_center,
+                    **kwargs,
+                )
+                padded = expert_ids_TK.reshape(-1) < 0
+                self.assertEqual(torch.count_nonzero(grad_x[padded]).item(), 0)
+                self.assertEqual(
+                    torch.count_nonzero(grad_scores.reshape(-1)[padded]).item(), 0
+                )
+                # BF16 outputs carry about 2e-3 rounding error; FP32 scores
+                # differ from FP64 only by reduction order.
+                for name, actual, expected, bound in (
+                    ("x", grad_x, x_ref.grad, 5e-3),
+                    ("scores", grad_scores, scores_ref.grad, 1e-4),
+                    ("weight", grad_weight, weight_ref.grad, 5e-3),
+                ):
+                    self.assertLess(
+                        _relative_l2(actual, expected), bound, f"{name} relative L2"
+                    )
+
     def test_callback_accumulates_closed_parameter_grad(self) -> None:
         """Match callback padding sanitation and its closed parameter gradient.
 
@@ -5163,6 +5387,7 @@ class DistMoeTwoRankTest(unittest.TestCase):
         inference: bool = False,
         fuse_swiglu: bool = False,
         weight_block_size: Literal["1x32", "32x32"] | None = None,
+        postprocess_parameters: tuple[tuple[str, torch.Tensor, torch.Tensor], ...] = (),
     ) -> None:
         """Run one precision through real peer dispatch and combine paths.
 
@@ -5189,6 +5414,11 @@ class DistMoeTwoRankTest(unittest.TestCase):
             inference: Whether to exercise forward-only MXFP8 execution.
             fuse_swiglu: Whether to interleave prepared inference W13.
             weight_block_size: Optional MXFP8 inference quantization grain.
+            postprocess_parameters: ``(name, parameter, reference)`` triples
+                for parameters of the expert-output postprocess. Each
+                parameter's rank-local gradient is summed across ranks and
+                compared with the gradient of its reference, which
+                ``reference_postprocess_fn`` uses on the global batch.
         """
         rank = dist.get_rank()
         device = torch.device("cuda", rank)
@@ -5463,6 +5693,21 @@ class DistMoeTwoRankTest(unittest.TestCase):
                     cosine,
                     f"{name} cosine similarity",
                 )
+            for name, parameter, reference_parameter in postprocess_parameters:
+                self.assertIsNotNone(parameter.grad, f"missing {name} gradient")
+                self.assertIsNotNone(
+                    reference_parameter.grad, f"missing reference {name} gradient"
+                )
+                # Each rank's gradient covers only its own routes.
+                global_grad = parameter.grad.float()
+                dist.all_reduce(global_grad)
+                torch.testing.assert_close(
+                    global_grad,
+                    reference_parameter.grad.float(),
+                    rtol=3e-2,
+                    atol=3e-2,
+                    msg=lambda message, name=name: f"{name}: {message}",
+                )
             if accumulate_execution:
                 self.assertEqual(hook_counts, {"w13": 1, "w2": 1})
                 self.assertIsNotNone(w13.grad)
@@ -5719,6 +5964,55 @@ class DistMoeTwoRankTest(unittest.TestCase):
                     ),
                     reference_postprocess_fn=reference_rmsnorm,
                     accumulate_execution=inplace_wgrad_accum,
+                )
+
+    @with_comms
+    def test_weighted_post_expert_rmsnorm_trains_gamma_across_ranks(self) -> None:
+        """Train input-scaled RMSNorm gamma through real peer dispatch.
+
+        BF16 with functional and in-place WGRAD must match the FP32 reference
+        output and input, score, and expert gradients, and the rank-summed
+        gamma gradient must match the reference gamma gradient within a
+        tolerance.
+        """
+        eps, gain_center, hidden_dim = 1e-6, 1.0, 1024
+        device = torch.device("cuda", dist.get_rank())
+        torch.manual_seed(77)
+        initial_gamma_D = 0.1 * torch.randn(
+            hidden_dim, device=device, dtype=torch.bfloat16
+        )
+        for inplace_wgrad_accum in (False, True):
+            with self.subTest(inplace_wgrad_accum=inplace_wgrad_accum):
+                gamma_D = initial_gamma_D.clone().requires_grad_()
+                reference_gamma_D = initial_gamma_D.clone().requires_grad_()
+
+                def reference_rmsnorm(
+                    h3_KD: torch.Tensor,
+                    reference_gamma_D: torch.Tensor = reference_gamma_D,
+                ) -> torch.Tensor:
+                    """Apply the FP32 input-scaled RMSNorm reference per route."""
+                    return F.rms_norm(
+                        h3_KD.float() * (reference_gamma_D.float() + gain_center),
+                        (h3_KD.shape[-1],),
+                        eps=eps,
+                    )
+
+                self._run_two_rank_numerics(
+                    None,
+                    options=dist_moe.ExecutionOptions(
+                        experts_output_postprocess=dist_moe.RMSNormPostprocess(
+                            eps=eps,
+                            norm_output_dtype=torch.float32,
+                            output_dtype=torch.bfloat16,
+                            require_bitwise=False,
+                            weight=gamma_D,
+                            gain_center=gain_center,
+                        ),
+                        inplace_wgrad_accum=inplace_wgrad_accum,
+                    ),
+                    reference_postprocess_fn=reference_rmsnorm,
+                    accumulate_execution=inplace_wgrad_accum,
+                    postprocess_parameters=(("gamma", gamma_D, reference_gamma_D),),
                 )
 
     @with_comms

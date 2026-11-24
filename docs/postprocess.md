@@ -11,6 +11,7 @@ output row per input token.
 - [Place fused RMSNorm](#place-fused-rmsnorm)
 - [Select a kernel schedule](#select-a-kernel-schedule)
 - [Configure the typed policy](#configure-the-typed-policy)
+- [Train a weighted norm](#train-a-weighted-norm)
 - [Understand saved state and recomputation](#understand-saved-state-and-recomputation)
 - [Follow backward](#follow-backward)
 - [Use observers and callbacks](#use-observers-and-callbacks)
@@ -26,7 +27,7 @@ behaviors:
 | --- | --- | --- | --- |
 | `None` | Multiply route rows by router scores and reduce top-k. | Differentiate score weighting and reduction. | Registered op, FakeTensor, non-strict `make_fx`, activation checkpointing, CUDA graphs. |
 | Callable | Apply the callback to each route row, then perform ordinary score weighting and reduction. | Recompute the callback under autograd and differentiate it with the reduction. | Eager only. |
-| `dist_moe.RMSNormPostprocess` | Fuse RMSNorm, router-score weighting, and top-k reduction. | Use the fused RMSNorm/reduction backward. | Callback-free policies use the registered graph boundary; observers select eager execution. |
+| `dist_moe.RMSNormPostprocess` | Fuse RMSNorm (optionally input-scaled by a gamma), router-score weighting, and top-k reduction. | Use the fused RMSNorm/reduction backward, which also returns the gamma gradient. | Callback-free policies use the registered graph boundary; observers select eager execution. |
 
 Routing scores and top-k expert IDs are inputs to Dist-MoE. Routing itself is
 not part of postprocessing and is not computed by these kernels.
@@ -164,7 +165,7 @@ output_TD = dist_moe.routed_experts(
 | `norm_output_dtype` | Precision of normalized route rows before score weighting. |
 | `output_dtype` | Final reduced output dtype; it must match the Dist-MoE output contract. |
 | `require_bitwise` | Preserve standalone reduction order when true; false permits faster numerically equivalent reductions. |
-| `weight` | Optional contiguous `[D]` gamma applied to the RMSNorm input. It is inference-only. |
+| `weight` | Optional contiguous `[D]` gamma applied to the RMSNorm input. BF16 training receives its gradient through autograd. |
 | `gain_center` | Scalar added to `weight`, including zero-centered-gamma policies. |
 | `use_kahan` | Enable compensated sum-of-squares in every normalization launch. |
 | `observe_expert_output_fn` | Optional read-only observer of pre-normalization route outputs. |
@@ -172,9 +173,8 @@ output_TD = dist_moe.routed_experts(
 | `recompute_rstd` | Omit reciprocal RMS values from forward state and recompute them from the saved expert output in backward. |
 
 The default is scalarless RMSNorm. Supplying `weight` computes
-`rmsnorm((weight + gain_center) * h3)` and is supported only for inference;
-training would require a gradient for gamma that the fused Dist-MoE backward
-does not publish.
+`rmsnorm((weight + gain_center) * h3)`. Inference supports it in BF16, MXFP8,
+and NVFP4.
 
 For inference, pass the contiguous gamma directly in the typed policy. This
 fragment assumes `inference_context` was created from a config with
@@ -201,6 +201,49 @@ output_TD = dist_moe.routed_experts(
     options=weighted_options,
 )
 ```
+
+<a id="train-a-weighted-norm"></a>
+## Train a weighted norm
+
+BF16 training accepts a weighted policy with `require_bitwise=False` and no
+observers. Pass the live parameter on every call, for example the unsharded
+tensor a data-parallel wrapper materializes for the current forward:
+
+```python
+weighted_options = dist_moe.ExecutionOptions(
+    experts_output_postprocess=dist_moe.RMSNormPostprocess(
+        weight=gamma_D,  # requires_grad=True
+        gain_center=1.0,
+        eps=1e-6,
+        norm_output_dtype=torch.float32,
+        output_dtype=torch.bfloat16,
+        require_bitwise=False,
+    )
+)
+output_TD = dist_moe.routed_experts(
+    x_TD, topk_expert_ids_TK, topk_scores_TK, w13, w2, context,
+    options=weighted_options,
+)
+```
+
+`weight` is an input of the registered Dist-MoE operator, so its gradient
+reaches `gamma_D` through ordinary autograd, together with the input, score,
+and expert-weight gradients. The gradient covers this rank's routes only;
+reduce it across ranks as for any other replicated parameter.
+
+Forward runs the same fused kernel as inference and saves only `h3`. Backward
+reads the saved `h3` directly from the activation buffer, or the recomputed
+`h3` from the combine buffer, and runs one kernel that recomputes the
+reciprocal RMS and writes the route gradient straight into the combine
+buffer. The same kernel computes the score gradient and accumulates the gamma
+gradient in registers per program. The gamma reduction therefore needs
+`programs x D` FP32 values, a few megabytes, rather than one row per route.
+
+The kernel treats the two BF16 roundings of the forward, `weight + gain_center`
+and the scaled input, as identity, and differentiates the FP32 normalization
+and weighting. Its reductions differ in order from an eager composition, so
+compare against one with a tolerance. Block-scaled training, observers, and
+other eager Python callbacks still require a callable postprocess.
 
 <a id="understand-saved-state-and-recomputation"></a>
 ## Understand saved state and recomputation
@@ -286,9 +329,11 @@ CUDA graphs replay fixed kernels and stable activation/communication-buffer addr
 ## Check supported combinations
 
 - BF16 and MXFP8 training: scalarless fused RMSNorm with forward/backward.
+- BF16 training: input-scale gamma RMSNorm with `require_bitwise=False` and a
+  gamma gradient through autograd.
 - BF16, MXFP8, and NVFP4 inference: scalarless or input-scale gamma RMSNorm.
 - Staged and Mega block-scaled execution: the same typed policy and output
   semantics.
 - Arbitrary callables and observers: eager only.
-- Weighted RMSNorm training: unsupported; use a callback when eager execution
-  and ordinary autograd ownership are acceptable.
+- Weighted RMSNorm training with block-scaled execution, observers, or other
+  Python callbacks: unsupported; use a callback postprocess.
